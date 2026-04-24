@@ -1,0 +1,6 @@
+@AlloChat.Backend_HostAddress = http://localhost:5098
+
+GET {{AlloChat.Backend_HostAddress}}/weatherforecast/
+Accept: application/json
+
+###
