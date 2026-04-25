@@ -1,4 +1,8 @@
-﻿using Microsoft.EntityFrameworkCore;
+﻿using System.Net.Http.Headers;
+using System.Security.Cryptography;
+using System.Text;
+using System.Text.Json;
+using Microsoft.EntityFrameworkCore;
 
 var builder = WebApplication.CreateBuilder(args);
 
@@ -21,6 +25,8 @@ builder.Services.AddDbContext<AlloChatDbContext>(options =>
     options.UseNpgsql(connectionString);
 });
 
+builder.Services.AddHttpClient<ApnsPushService>();
+
 var app = builder.Build();
 
 // Swagger actif aussi en production
@@ -32,6 +38,7 @@ using (var scope = app.Services.CreateScope())
 {
     var db = scope.ServiceProvider.GetRequiredService<AlloChatDbContext>();
     db.Database.EnsureCreated();
+    EnsureDeviceTokensTable(db);
 }
 
 // Endpoint de test existant
@@ -136,7 +143,73 @@ app.MapPost("/api/users/lookup", async (ContactLookupRequest request, AlloChatDb
 .WithName("LookupContact")
 .WithOpenApi();
 
-app.MapPost("/api/messages/send", async (SendMessageRequest request, AlloChatDbContext db) =>
+app.MapPost("/api/devices/register", async (RegisterDeviceRequest request, AlloChatDbContext db) =>
+{
+    if (string.IsNullOrWhiteSpace(request.UserID) ||
+        string.IsNullOrWhiteSpace(request.DeviceToken))
+    {
+        return Results.BadRequest(new StandardServerResponse(
+            false,
+            "UserID and DeviceToken are required."
+        ));
+    }
+
+    var userExists = await db.Users.AnyAsync(u => u.UserID == request.UserID);
+
+    if (!userExists)
+    {
+        return Results.NotFound(new StandardServerResponse(
+            false,
+            "User not found."
+        ));
+    }
+
+    var cleanToken = request.DeviceToken.Trim();
+    var cleanPlatform = string.IsNullOrWhiteSpace(request.Platform)
+        ? "watchOS"
+        : request.Platform.Trim();
+
+    var existingToken = await db.DeviceTokens
+        .FirstOrDefaultAsync(t => t.Token == cleanToken);
+
+    if (existingToken == null)
+    {
+        var deviceToken = new DeviceTokenEntity
+        {
+            DeviceTokenID = Guid.NewGuid().ToString(),
+            UserID = request.UserID,
+            Token = cleanToken,
+            Platform = cleanPlatform,
+            IsActive = true,
+            CreatedAt = DateTime.UtcNow,
+            LastSeenAt = DateTime.UtcNow
+        };
+
+        db.DeviceTokens.Add(deviceToken);
+    }
+    else
+    {
+        existingToken.UserID = request.UserID;
+        existingToken.Platform = cleanPlatform;
+        existingToken.IsActive = true;
+        existingToken.LastSeenAt = DateTime.UtcNow;
+    }
+
+    await db.SaveChangesAsync();
+
+    return Results.Ok(new StandardServerResponse(
+        true,
+        "Device token registered."
+    ));
+})
+.WithName("RegisterDeviceToken")
+.WithOpenApi();
+
+app.MapPost("/api/messages/send", async (
+    SendMessageRequest request,
+    AlloChatDbContext db,
+    ApnsPushService pushService
+) =>
 {
     if (string.IsNullOrWhiteSpace(request.SenderID) ||
         string.IsNullOrWhiteSpace(request.ReceiverID) ||
@@ -148,10 +221,10 @@ app.MapPost("/api/messages/send", async (SendMessageRequest request, AlloChatDbC
         ));
     }
 
-    var senderExists = await db.Users.AnyAsync(u => u.UserID == request.SenderID);
+    var sender = await db.Users.FirstOrDefaultAsync(u => u.UserID == request.SenderID);
     var receiverExists = await db.Users.AnyAsync(u => u.UserID == request.ReceiverID);
 
-    if (!senderExists || !receiverExists)
+    if (sender == null || !receiverExists)
     {
         return Results.NotFound(new StandardServerResponse(
             false,
@@ -171,6 +244,32 @@ app.MapPost("/api/messages/send", async (SendMessageRequest request, AlloChatDbC
 
     db.Messages.Add(message);
     await db.SaveChangesAsync();
+
+    var receiverTokens = await db.DeviceTokens
+        .Where(t => t.UserID == request.ReceiverID && t.IsActive)
+        .ToListAsync();
+
+    var senderName = BuildDisplayName(sender);
+
+    foreach (var token in receiverTokens)
+    {
+        var pushResult = await pushService.SendMessageNotificationAsync(
+            deviceToken: token.Token,
+            title: senderName,
+            body: message.Content
+        );
+
+        if (!pushResult.Success &&
+            (pushResult.StatusCode == 400 || pushResult.StatusCode == 410))
+        {
+            token.IsActive = false;
+        }
+    }
+
+    if (receiverTokens.Any(t => !t.IsActive))
+    {
+        await db.SaveChangesAsync();
+    }
 
     return Results.Ok(new SendMessageResponse(
         true,
@@ -283,6 +382,184 @@ static string ConvertDatabaseUrlToConnectionString(string databaseUrl)
     return string.Join(";", connectionParts) + ";";
 }
 
+static string BuildDisplayName(RegisteredUserEntity user)
+{
+    if (!string.IsNullOrWhiteSpace(user.Nickname))
+    {
+        return user.Nickname.Trim();
+    }
+
+    var fullName = $"{user.FirstName} {user.LastName}".Trim();
+
+    return string.IsNullOrWhiteSpace(fullName) ? "AlloChat" : fullName;
+}
+
+static void EnsureDeviceTokensTable(AlloChatDbContext db)
+{
+    db.Database.ExecuteSqlRaw("""
+        CREATE TABLE IF NOT EXISTS "DeviceTokens" (
+            "DeviceTokenID" text NOT NULL,
+            "UserID" text NOT NULL,
+            "Token" text NOT NULL,
+            "Platform" text NOT NULL,
+            "IsActive" boolean NOT NULL,
+            "CreatedAt" timestamp with time zone NOT NULL,
+            "LastSeenAt" timestamp with time zone NOT NULL,
+            CONSTRAINT "PK_DeviceTokens" PRIMARY KEY ("DeviceTokenID")
+        );
+    """);
+
+    db.Database.ExecuteSqlRaw("""
+        CREATE UNIQUE INDEX IF NOT EXISTS "IX_DeviceTokens_Token"
+        ON "DeviceTokens" ("Token");
+    """);
+
+    db.Database.ExecuteSqlRaw("""
+        CREATE INDEX IF NOT EXISTS "IX_DeviceTokens_UserID"
+        ON "DeviceTokens" ("UserID");
+    """);
+}
+
+static string Base64UrlEncode(byte[] input)
+{
+    return Convert.ToBase64String(input)
+        .TrimEnd('=')
+        .Replace('+', '-')
+        .Replace('/', '_');
+}
+
+// -------- APNs --------
+
+class ApnsPushService
+{
+    private readonly HttpClient _httpClient;
+
+    public ApnsPushService(HttpClient httpClient)
+    {
+        _httpClient = httpClient;
+    }
+
+    public async Task<ApnsSendResult> SendMessageNotificationAsync(
+        string deviceToken,
+        string title,
+        string body
+    )
+    {
+        var keyID = Environment.GetEnvironmentVariable("APNS_KEY_ID") ?? "";
+        var teamID = Environment.GetEnvironmentVariable("APNS_TEAM_ID") ?? "";
+        var bundleID = Environment.GetEnvironmentVariable("APNS_BUNDLE_ID") ?? "";
+        var privateKey = Environment.GetEnvironmentVariable("APNS_PRIVATE_KEY") ?? "";
+        var apnsEnv = Environment.GetEnvironmentVariable("APNS_ENV") ?? "production";
+
+        if (string.IsNullOrWhiteSpace(keyID) ||
+            string.IsNullOrWhiteSpace(teamID) ||
+            string.IsNullOrWhiteSpace(bundleID) ||
+            string.IsNullOrWhiteSpace(privateKey))
+        {
+            return new ApnsSendResult(false, 0, "Missing APNs environment variables.");
+        }
+
+        try
+        {
+            var jwt = CreateProviderToken(
+                keyID: keyID,
+                teamID: teamID,
+                privateKeyPem: privateKey
+            );
+
+            var host = apnsEnv.Equals("sandbox", StringComparison.OrdinalIgnoreCase)
+                ? "https://api.sandbox.push.apple.com"
+                : "https://api.push.apple.com";
+
+            var url = $"{host}/3/device/{deviceToken}";
+
+            var payload = new
+            {
+                aps = new
+                {
+                    alert = new
+                    {
+                        title,
+                        body
+                    },
+                    sound = "default"
+                }
+            };
+
+            var json = JsonSerializer.Serialize(payload);
+
+            using var request = new HttpRequestMessage(HttpMethod.Post, url)
+            {
+                Version = new Version(2, 0),
+                Content = new StringContent(json, Encoding.UTF8, "application/json")
+            };
+
+            request.Headers.Authorization = new AuthenticationHeaderValue("bearer", jwt);
+            request.Headers.TryAddWithoutValidation("apns-topic", bundleID);
+            request.Headers.TryAddWithoutValidation("apns-push-type", "alert");
+            request.Headers.TryAddWithoutValidation("apns-priority", "10");
+
+            var response = await _httpClient.SendAsync(request);
+            var responseBody = await response.Content.ReadAsStringAsync();
+
+            return new ApnsSendResult(
+                response.IsSuccessStatusCode,
+                (int)response.StatusCode,
+                responseBody
+            );
+        }
+        catch (Exception ex)
+        {
+            return new ApnsSendResult(false, 0, ex.Message);
+        }
+    }
+
+    private static string CreateProviderToken(
+        string keyID,
+        string teamID,
+        string privateKeyPem
+    )
+    {
+        var cleanPrivateKey = privateKeyPem.Replace("\\n", "\n");
+
+        var headerJson = JsonSerializer.Serialize(new Dictionary<string, object>
+        {
+            ["alg"] = "ES256",
+            ["kid"] = keyID
+        });
+
+        var iat = DateTimeOffset.UtcNow.ToUnixTimeSeconds();
+
+        var claimsJson = JsonSerializer.Serialize(new Dictionary<string, object>
+        {
+            ["iss"] = teamID,
+            ["iat"] = iat
+        });
+
+        var header = Base64UrlEncode(Encoding.UTF8.GetBytes(headerJson));
+        var claims = Base64UrlEncode(Encoding.UTF8.GetBytes(claimsJson));
+        var unsignedToken = $"{header}.{claims}";
+
+        using var ecdsa = ECDsa.Create();
+        ecdsa.ImportFromPem(cleanPrivateKey);
+
+        var signatureBytes = ecdsa.SignData(
+            Encoding.UTF8.GetBytes(unsignedToken),
+            HashAlgorithmName.SHA256
+        );
+
+        var signature = Base64UrlEncode(signatureBytes);
+
+        return $"{unsignedToken}.{signature}";
+    }
+}
+
+record ApnsSendResult(
+    bool Success,
+    int StatusCode,
+    string ResponseBody
+);
+
 // -------- Database --------
 
 class AlloChatDbContext : DbContext
@@ -293,6 +570,7 @@ class AlloChatDbContext : DbContext
 
     public DbSet<RegisteredUserEntity> Users => Set<RegisteredUserEntity>();
     public DbSet<ChatMessageEntity> Messages => Set<ChatMessageEntity>();
+    public DbSet<DeviceTokenEntity> DeviceTokens => Set<DeviceTokenEntity>();
 
     protected override void OnModelCreating(ModelBuilder modelBuilder)
     {
@@ -311,6 +589,16 @@ class AlloChatDbContext : DbContext
 
         modelBuilder.Entity<ChatMessageEntity>()
             .HasIndex(m => m.SenderID);
+
+        modelBuilder.Entity<DeviceTokenEntity>()
+            .HasKey(t => t.DeviceTokenID);
+
+        modelBuilder.Entity<DeviceTokenEntity>()
+            .HasIndex(t => t.Token)
+            .IsUnique();
+
+        modelBuilder.Entity<DeviceTokenEntity>()
+            .HasIndex(t => t.UserID);
     }
 }
 
@@ -335,6 +623,17 @@ class ChatMessageEntity
     public string Content { get; set; } = "";
     public DateTime SentAt { get; set; }
     public bool Delivered { get; set; }
+}
+
+class DeviceTokenEntity
+{
+    public string DeviceTokenID { get; set; } = "";
+    public string UserID { get; set; } = "";
+    public string Token { get; set; } = "";
+    public string Platform { get; set; } = "watchOS";
+    public bool IsActive { get; set; } = true;
+    public DateTime CreatedAt { get; set; }
+    public DateTime LastSeenAt { get; set; }
 }
 
 // -------- Models --------
@@ -408,4 +707,10 @@ record ContactLookupResponse(
     string PhoneNumber,
     string AvatarSystemName,
     string Availability
+);
+
+record RegisterDeviceRequest(
+    string UserID,
+    string DeviceToken,
+    string? Platform
 );
