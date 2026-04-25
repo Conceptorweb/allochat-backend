@@ -420,13 +420,7 @@ static void EnsureDeviceTokensTable(AlloChatDbContext db)
     """);
 }
 
-static string Base64UrlEncode(byte[] input)
-{
-    return Convert.ToBase64String(input)
-        .TrimEnd('=')
-        .Replace('+', '-')
-        .Replace('/', '_');
-}
+
 
 // -------- APNs --------
 
@@ -536,8 +530,8 @@ class ApnsPushService
             ["iat"] = iat
         });
 
-        var header = Base64UrlEncode(Encoding.UTF8.GetBytes(headerJson));
-        var claims = Base64UrlEncode(Encoding.UTF8.GetBytes(claimsJson));
+        var header = Utils.Base64UrlEncode(Encoding.UTF8.GetBytes(headerJson));
+        var claims = Utils.Base64UrlEncode(Encoding.UTF8.GetBytes(claimsJson));
         var unsignedToken = $"{header}.{claims}";
 
         using var ecdsa = ECDsa.Create();
@@ -548,7 +542,7 @@ class ApnsPushService
             HashAlgorithmName.SHA256
         );
 
-        var signature = Base64UrlEncode(signatureBytes);
+        var signature = Utils.Base64UrlEncode(signatureBytes);
 
         return $"{unsignedToken}.{signature}";
     }
@@ -714,3 +708,14 @@ record RegisterDeviceRequest(
     string DeviceToken,
     string? Platform
 );
+
+static class Utils
+{
+    public static string Base64UrlEncode(byte[] input)
+    {
+        return Convert.ToBase64String(input)
+            .TrimEnd('=')
+            .Replace('+', '-')
+            .Replace('/', '_');
+    }
+}
