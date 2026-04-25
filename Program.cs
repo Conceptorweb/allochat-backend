@@ -265,14 +265,22 @@ static string ConvertDatabaseUrlToConnectionString(string databaseUrl)
 
     var database = uri.AbsolutePath.TrimStart('/');
 
-    return
-        $"Host={uri.Host};" +
-        $"Port={uri.Port};" +
-        $"Database={database};" +
-        $"Username={username};" +
-        $"Password={password};" +
-        $"Ssl Mode=Prefer;" +
-        $"Trust Server Certificate=true;";
+    var connectionParts = new List<string>
+    {
+        $"Host={uri.Host}",
+        $"Database={database}",
+        $"Username={username}",
+        $"Password={password}",
+        "Ssl Mode=Require",
+        "Trust Server Certificate=true"
+    };
+
+    if (uri.Port > 0)
+    {
+        connectionParts.Insert(1, $"Port={uri.Port}");
+    }
+
+    return string.Join(";", connectionParts) + ";";
 }
 
 // -------- Database --------
