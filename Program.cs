@@ -1,4 +1,4 @@
-﻿using System.Collections.Concurrent;
+﻿using Microsoft.EntityFrameworkCore;
 
 var builder = WebApplication.CreateBuilder(args);
 
@@ -6,18 +6,33 @@ var builder = WebApplication.CreateBuilder(args);
 builder.Services.AddEndpointsApiExplorer();
 builder.Services.AddSwaggerGen();
 
+// PostgreSQL / Entity Framework
+var databaseUrl = Environment.GetEnvironmentVariable("DATABASE_URL");
+
+if (string.IsNullOrWhiteSpace(databaseUrl))
+{
+    throw new InvalidOperationException("DATABASE_URL environment variable is missing.");
+}
+
+var connectionString = ConvertDatabaseUrlToConnectionString(databaseUrl);
+
+builder.Services.AddDbContext<AlloChatDbContext>(options =>
+{
+    options.UseNpgsql(connectionString);
+});
+
 var app = builder.Build();
 
-// Swagger actif aussi sous IIS / Production
+// Swagger actif aussi en production
 app.UseSwagger();
 app.UseSwaggerUI();
 
-app.UseHttpsRedirection();
-
-// Stockage temporaire en mémoire pour la V1 de test
-var users = new ConcurrentDictionary<string, RegisteredUser>();
-
-var messages = new ConcurrentBag<ChatMessage>();
+// Création automatique des tables si elles n'existent pas
+using (var scope = app.Services.CreateScope())
+{
+    var db = scope.ServiceProvider.GetRequiredService<AlloChatDbContext>();
+    db.Database.EnsureCreated();
+}
 
 // Endpoint de test existant
 var summaries = new[]
@@ -40,8 +55,7 @@ app.MapGet("/weatherforecast", () =>
 .WithName("GetWeatherForecast")
 .WithOpenApi();
 
-// ✅ Première vraie route AlloChat
-app.MapPost("/api/users/register", (RegisterUserRequest request) =>
+app.MapPost("/api/users/register", async (RegisterUserRequest request, AlloChatDbContext db) =>
 {
     if (string.IsNullOrWhiteSpace(request.FirstName) ||
         string.IsNullOrWhiteSpace(request.LastName))
@@ -53,25 +67,31 @@ app.MapPost("/api/users/register", (RegisterUserRequest request) =>
     }
 
     var userID = Guid.NewGuid().ToString();
-    var alloCode = GenerateAlloCode(users);
+    var alloCode = await GenerateAlloCode(db);
 
-    var user = new RegisteredUser(
-        userID,
-        alloCode,
-        request.FirstName.Trim(),
-        request.LastName.Trim(),
-        request.AvatarSystemName?.Trim() ?? "",
-        request.Availability?.Trim() ?? "Available",
-        DateTime.UtcNow
-    );
+    var user = new RegisteredUserEntity
+    {
+        UserID = userID,
+        AlloCode = alloCode,
+        FirstName = request.FirstName.Trim(),
+        LastName = request.LastName.Trim(),
+        Nickname = request.Nickname?.Trim() ?? "",
+        PhoneNumber = request.PhoneNumber?.Trim() ?? "",
+        AvatarSystemName = request.AvatarSystemName?.Trim() ?? "",
+        Availability = request.Availability?.Trim() ?? "Available",
+        CreatedAt = DateTime.UtcNow
+    };
 
-    users[userID] = user;
+    db.Users.Add(user);
+    await db.SaveChangesAsync();
 
     var response = new RegisterUserResponse(
         user.UserID,
         user.AlloCode,
         user.FirstName,
         user.LastName,
+        user.Nickname,
+        user.PhoneNumber,
         user.AvatarSystemName,
         user.Availability
     );
@@ -81,9 +101,7 @@ app.MapPost("/api/users/register", (RegisterUserRequest request) =>
 .WithName("RegisterUser")
 .WithOpenApi();
 
-
-
-app.MapPost("/api/users/lookup", (ContactLookupRequest request) =>
+app.MapPost("/api/users/lookup", async (ContactLookupRequest request, AlloChatDbContext db) =>
 {
     if (string.IsNullOrWhiteSpace(request.AlloCode))
     {
@@ -93,9 +111,9 @@ app.MapPost("/api/users/lookup", (ContactLookupRequest request) =>
         ));
     }
 
-    var user = users.Values.FirstOrDefault(u =>
-        u.AlloCode.Equals(request.AlloCode.Trim(), StringComparison.OrdinalIgnoreCase)
-    );
+    var cleanCode = request.AlloCode.Trim().ToUpperInvariant();
+
+    var user = await db.Users.FirstOrDefaultAsync(u => u.AlloCode.ToUpper() == cleanCode);
 
     if (user == null)
     {
@@ -109,6 +127,8 @@ app.MapPost("/api/users/lookup", (ContactLookupRequest request) =>
         user.UserID,
         user.AlloCode,
         $"{user.FirstName} {user.LastName}".Trim(),
+        user.Nickname,
+        user.PhoneNumber,
         user.AvatarSystemName,
         user.Availability
     ));
@@ -116,9 +136,7 @@ app.MapPost("/api/users/lookup", (ContactLookupRequest request) =>
 .WithName("LookupContact")
 .WithOpenApi();
 
-
-
-app.MapPost("/api/messages/send", (SendMessageRequest request) =>
+app.MapPost("/api/messages/send", async (SendMessageRequest request, AlloChatDbContext db) =>
 {
     if (string.IsNullOrWhiteSpace(request.SenderID) ||
         string.IsNullOrWhiteSpace(request.ReceiverID) ||
@@ -130,16 +148,29 @@ app.MapPost("/api/messages/send", (SendMessageRequest request) =>
         ));
     }
 
-    var message = new ChatMessage(
-        Guid.NewGuid().ToString(),
-        request.SenderID,
-        request.ReceiverID,
-        request.Content,
-        DateTime.UtcNow,
-        false
-    );
+    var senderExists = await db.Users.AnyAsync(u => u.UserID == request.SenderID);
+    var receiverExists = await db.Users.AnyAsync(u => u.UserID == request.ReceiverID);
 
-    messages.Add(message);
+    if (!senderExists || !receiverExists)
+    {
+        return Results.NotFound(new StandardServerResponse(
+            false,
+            "Sender or receiver not found."
+        ));
+    }
+
+    var message = new ChatMessageEntity
+    {
+        MessageID = Guid.NewGuid().ToString(),
+        SenderID = request.SenderID,
+        ReceiverID = request.ReceiverID,
+        Content = request.Content.Trim(),
+        SentAt = DateTime.UtcNow,
+        Delivered = false
+    };
+
+    db.Messages.Add(message);
+    await db.SaveChangesAsync();
 
     return Results.Ok(new SendMessageResponse(
         true,
@@ -149,8 +180,7 @@ app.MapPost("/api/messages/send", (SendMessageRequest request) =>
 .WithName("SendMessage")
 .WithOpenApi();
 
-
-app.MapGet("/api/messages/pending/{userID}", (string userID) =>
+app.MapGet("/api/messages/pending/{userID}", async (string userID, AlloChatDbContext db) =>
 {
     if (string.IsNullOrWhiteSpace(userID))
     {
@@ -160,7 +190,7 @@ app.MapGet("/api/messages/pending/{userID}", (string userID) =>
         ));
     }
 
-    var pending = messages
+    var pending = await db.Messages
         .Where(m => m.ReceiverID == userID && !m.Delivered)
         .OrderBy(m => m.SentAt)
         .Select(m => new PendingMessageItem(
@@ -170,15 +200,14 @@ app.MapGet("/api/messages/pending/{userID}", (string userID) =>
             m.Content,
             m.SentAt
         ))
-        .ToList();
+        .ToListAsync();
 
     return Results.Ok(new PendingMessagesResponse(pending));
 })
 .WithName("GetPendingMessages")
 .WithOpenApi();
 
-
-app.MapPost("/api/messages/acknowledge", (AcknowledgeMessageRequest request) =>
+app.MapPost("/api/messages/acknowledge", async (AcknowledgeMessageRequest request, AlloChatDbContext db) =>
 {
     if (request.MessageIDs == null || !request.MessageIDs.Any())
     {
@@ -188,42 +217,116 @@ app.MapPost("/api/messages/acknowledge", (AcknowledgeMessageRequest request) =>
         ));
     }
 
-    int updatedCount = 0;
+    var messagesToUpdate = await db.Messages
+        .Where(m => request.MessageIDs.Contains(m.MessageID) && !m.Delivered)
+        .ToListAsync();
 
-    foreach (var msg in messages)
+    foreach (var message in messagesToUpdate)
     {
-        if (request.MessageIDs.Contains(msg.MessageID) && !msg.Delivered)
-        {
-            // comme ConcurrentBag ne permet pas modification directe,
-            // on recrée le message marqué comme Delivered
-            var updated = msg with { Delivered = true };
-            messages.Add(updated);
-            updatedCount++;
-        }
+        message.Delivered = true;
     }
+
+    await db.SaveChangesAsync();
 
     return Results.Ok(new StandardServerResponse(
         true,
-        $"{updatedCount} messages acknowledged."
+        $"{messagesToUpdate.Count} messages acknowledged."
     ));
 })
 .WithName("AcknowledgeMessages")
 .WithOpenApi();
 
-
-app.Run("http://0.0.0.0:5098");
+var port = Environment.GetEnvironmentVariable("PORT") ?? "10000";
+app.Run($"http://0.0.0.0:{port}");
 
 // -------- Helpers --------
 
-static string GenerateAlloCode(ConcurrentDictionary<string, RegisteredUser> users)
+static async Task<string> GenerateAlloCode(AlloChatDbContext db)
 {
     while (true)
     {
         var code = "ALLO" + Random.Shared.Next(100000, 999999);
-        var exists = users.Values.Any(u => u.AlloCode.Equals(code, StringComparison.OrdinalIgnoreCase));
+        var exists = await db.Users.AnyAsync(u => u.AlloCode == code);
+
         if (!exists)
+        {
             return code;
+        }
     }
+}
+
+static string ConvertDatabaseUrlToConnectionString(string databaseUrl)
+{
+    var uri = new Uri(databaseUrl);
+
+    var userInfo = uri.UserInfo.Split(':', 2);
+    var username = Uri.UnescapeDataString(userInfo[0]);
+    var password = userInfo.Length > 1 ? Uri.UnescapeDataString(userInfo[1]) : "";
+
+    var database = uri.AbsolutePath.TrimStart('/');
+
+    return
+        $"Host={uri.Host};" +
+        $"Port={uri.Port};" +
+        $"Database={database};" +
+        $"Username={username};" +
+        $"Password={password};" +
+        $"Ssl Mode=Prefer;" +
+        $"Trust Server Certificate=true;";
+}
+
+// -------- Database --------
+
+class AlloChatDbContext : DbContext
+{
+    public AlloChatDbContext(DbContextOptions<AlloChatDbContext> options) : base(options)
+    {
+    }
+
+    public DbSet<RegisteredUserEntity> Users => Set<RegisteredUserEntity>();
+    public DbSet<ChatMessageEntity> Messages => Set<ChatMessageEntity>();
+
+    protected override void OnModelCreating(ModelBuilder modelBuilder)
+    {
+        modelBuilder.Entity<RegisteredUserEntity>()
+            .HasKey(u => u.UserID);
+
+        modelBuilder.Entity<RegisteredUserEntity>()
+            .HasIndex(u => u.AlloCode)
+            .IsUnique();
+
+        modelBuilder.Entity<ChatMessageEntity>()
+            .HasKey(m => m.MessageID);
+
+        modelBuilder.Entity<ChatMessageEntity>()
+            .HasIndex(m => m.ReceiverID);
+
+        modelBuilder.Entity<ChatMessageEntity>()
+            .HasIndex(m => m.SenderID);
+    }
+}
+
+class RegisteredUserEntity
+{
+    public string UserID { get; set; } = "";
+    public string AlloCode { get; set; } = "";
+    public string FirstName { get; set; } = "";
+    public string LastName { get; set; } = "";
+    public string Nickname { get; set; } = "";
+    public string PhoneNumber { get; set; } = "";
+    public string AvatarSystemName { get; set; } = "";
+    public string Availability { get; set; } = "Available";
+    public DateTime CreatedAt { get; set; }
+}
+
+class ChatMessageEntity
+{
+    public string MessageID { get; set; } = "";
+    public string SenderID { get; set; } = "";
+    public string ReceiverID { get; set; } = "";
+    public string Content { get; set; } = "";
+    public DateTime SentAt { get; set; }
+    public bool Delivered { get; set; }
 }
 
 // -------- Models --------
@@ -236,8 +339,10 @@ record WeatherForecast(DateOnly Date, int TemperatureC, string? Summary)
 record RegisterUserRequest(
     string FirstName,
     string LastName,
-    string AvatarSystemName,
-    string Availability
+    string? Nickname,
+    string? PhoneNumber,
+    string? AvatarSystemName,
+    string? Availability
 );
 
 record RegisterUserResponse(
@@ -245,6 +350,8 @@ record RegisterUserResponse(
     string AlloCode,
     string FirstName,
     string LastName,
+    string Nickname,
+    string PhoneNumber,
     string AvatarSystemName,
     string Availability
 );
@@ -252,16 +359,6 @@ record RegisterUserResponse(
 record StandardServerResponse(
     bool Success,
     string Message
-);
-
-record RegisteredUser(
-    string UserID,
-    string AlloCode,
-    string FirstName,
-    string LastName,
-    string AvatarSystemName,
-    string Availability,
-    DateTime CreatedAt
 );
 
 record SendMessageRequest(
@@ -273,15 +370,6 @@ record SendMessageRequest(
 record SendMessageResponse(
     bool Success,
     string Message
-);
-
-record ChatMessage(
-    string MessageID,
-    string SenderID,
-    string ReceiverID,
-    string Content,
-    DateTime SentAt,
-    bool Delivered
 );
 
 record PendingMessageItem(
@@ -300,7 +388,6 @@ record AcknowledgeMessageRequest(
     List<string> MessageIDs
 );
 
-
 record ContactLookupRequest(
     string AlloCode
 );
@@ -309,6 +396,8 @@ record ContactLookupResponse(
     string UserID,
     string AlloCode,
     string DisplayName,
+    string Nickname,
+    string PhoneNumber,
     string AvatarSystemName,
     string Availability
 );
