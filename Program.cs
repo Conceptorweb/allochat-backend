@@ -1,10 +1,14 @@
-﻿using System.Net.Http.Headers;
+﻿using System.Collections.Concurrent;
+using System.Net.Http.Headers;
 using System.Security.Cryptography;
 using System.Text;
 using System.Text.Json;
 using Microsoft.EntityFrameworkCore;
 
 var builder = WebApplication.CreateBuilder(args);
+
+var phoneVerificationCodes = new ConcurrentDictionary<string, PhoneVerificationState>();
+var verifiedPhoneNumbers = new ConcurrentDictionary<string, DateTime>();
 
 // Swagger / OpenAPI
 builder.Services.AddEndpointsApiExplorer();
@@ -62,15 +66,196 @@ app.MapGet("/weatherforecast", () =>
 .WithName("GetWeatherForecast")
 .WithOpenApi();
 
-app.MapPost("/api/users/register", async (RegisterUserRequest request, AlloChatDbContext db) =>
+app.MapPost("/api/phone/send-code", async (PhoneVerificationRequest request, AlloChatDbContext db) =>
 {
-    if (string.IsNullOrWhiteSpace(request.FirstName) ||
-        string.IsNullOrWhiteSpace(request.LastName))
+    var cleanPhoneNumber = request.PhoneNumber?.Trim() ?? "";
+
+    if (string.IsNullOrWhiteSpace(cleanPhoneNumber))
     {
         return Results.BadRequest(new StandardServerResponse(
             false,
-            "First name and last name are required."
+            "Phone number is required."
         ));
+    }
+
+    if (IsTestPhoneNumber(cleanPhoneNumber))
+    {
+        return Results.Ok(new StandardServerResponse(
+            true,
+            "Test phone number accepted. No SMS verification required."
+        ));
+    }
+
+    if (!IsLikelyInternationalPhoneNumber(cleanPhoneNumber))
+    {
+        return Results.BadRequest(new StandardServerResponse(
+            false,
+            "Phone number must use international format, for example +972501234567."
+        ));
+    }
+
+    var phoneAlreadyUsed = await db.Users.AnyAsync(u => u.PhoneNumber == cleanPhoneNumber);
+
+    if (phoneAlreadyUsed)
+    {
+        return Results.BadRequest(new StandardServerResponse(
+            false,
+            "This phone number is already registered."
+        ));
+    }
+
+    var code = Random.Shared.Next(100000, 999999).ToString();
+
+    phoneVerificationCodes[cleanPhoneNumber] = new PhoneVerificationState(
+        Code: code,
+        CreatedAt: DateTime.UtcNow,
+        ExpiresAt: DateTime.UtcNow.AddMinutes(10),
+        Attempts: 0
+    );
+
+    Console.WriteLine($"AlloChat verification code for {cleanPhoneNumber}: {code}");
+
+    return Results.Ok(new StandardServerResponse(
+        true,
+        "Verification code sent."
+    ));
+})
+.WithName("SendPhoneVerificationCode")
+.WithOpenApi();
+
+app.MapPost("/api/phone/verify-code", (PhoneCodeValidationRequest request) =>
+{
+    var cleanPhoneNumber = request.PhoneNumber?.Trim() ?? "";
+    var cleanCode = request.Code?.Trim() ?? "";
+
+    if (string.IsNullOrWhiteSpace(cleanPhoneNumber) ||
+        string.IsNullOrWhiteSpace(cleanCode))
+    {
+        return Results.BadRequest(new StandardServerResponse(
+            false,
+            "Phone number and verification code are required."
+        ));
+    }
+
+    if (IsTestPhoneNumber(cleanPhoneNumber))
+    {
+        verifiedPhoneNumbers[cleanPhoneNumber] = DateTime.UtcNow.AddHours(1);
+
+        return Results.Ok(new StandardServerResponse(
+            true,
+            "Test phone number verified."
+        ));
+    }
+
+    if (!phoneVerificationCodes.TryGetValue(cleanPhoneNumber, out var state))
+    {
+        return Results.BadRequest(new StandardServerResponse(
+            false,
+            "No verification code found. Please request a new code."
+        ));
+    }
+
+    if (state.ExpiresAt < DateTime.UtcNow)
+    {
+        phoneVerificationCodes.TryRemove(cleanPhoneNumber, out _);
+
+        return Results.BadRequest(new StandardServerResponse(
+            false,
+            "Verification code expired. Please request a new code."
+        ));
+    }
+
+    if (state.Attempts >= 5)
+    {
+        phoneVerificationCodes.TryRemove(cleanPhoneNumber, out _);
+
+        return Results.BadRequest(new StandardServerResponse(
+            false,
+            "Too many attempts. Please request a new code."
+        ));
+    }
+
+    if (state.Code != cleanCode)
+    {
+        phoneVerificationCodes[cleanPhoneNumber] = state with
+        {
+            Attempts = state.Attempts + 1
+        };
+
+        return Results.BadRequest(new StandardServerResponse(
+            false,
+            "Invalid verification code."
+        ));
+    }
+
+    phoneVerificationCodes.TryRemove(cleanPhoneNumber, out _);
+    verifiedPhoneNumbers[cleanPhoneNumber] = DateTime.UtcNow.AddMinutes(30);
+
+    return Results.Ok(new StandardServerResponse(
+        true,
+        "Phone number verified."
+    ));
+})
+.WithName("VerifyPhoneCode")
+.WithOpenApi();
+
+app.MapPost("/api/users/register", async (RegisterUserRequest request, AlloChatDbContext db) =>
+{
+    var cleanFirstName = request.FirstName?.Trim() ?? "";
+    var cleanLastName = request.LastName?.Trim() ?? "";
+    var cleanNickname = request.Nickname?.Trim() ?? "";
+    var cleanPhoneNumber = request.PhoneNumber?.Trim() ?? "";
+    var cleanAvatarSystemName = request.AvatarSystemName?.Trim() ?? "";
+    var cleanAvailability = string.IsNullOrWhiteSpace(request.Availability)
+        ? "Available"
+        : request.Availability.Trim();
+
+    if (string.IsNullOrWhiteSpace(cleanFirstName) ||
+        string.IsNullOrWhiteSpace(cleanLastName) ||
+        string.IsNullOrWhiteSpace(cleanNickname))
+    {
+        return Results.BadRequest(new StandardServerResponse(
+            false,
+            "First name, last name and nickname are required."
+        ));
+    }
+
+    if (string.IsNullOrWhiteSpace(cleanPhoneNumber))
+    {
+        return Results.BadRequest(new StandardServerResponse(
+            false,
+            "Phone number is required."
+        ));
+    }
+
+    if (!IsTestPhoneNumber(cleanPhoneNumber))
+    {
+        if (!IsLikelyInternationalPhoneNumber(cleanPhoneNumber))
+        {
+            return Results.BadRequest(new StandardServerResponse(
+                false,
+                "Phone number must use international format, for example +972501234567."
+            ));
+        }
+
+        var phoneAlreadyUsed = await db.Users.AnyAsync(u => u.PhoneNumber == cleanPhoneNumber);
+
+        if (phoneAlreadyUsed)
+        {
+            return Results.BadRequest(new StandardServerResponse(
+                false,
+                "This phone number is already registered."
+            ));
+        }
+
+        if (!verifiedPhoneNumbers.TryGetValue(cleanPhoneNumber, out var verifiedUntil) ||
+            verifiedUntil < DateTime.UtcNow)
+        {
+            return Results.BadRequest(new StandardServerResponse(
+                false,
+                "Phone number is not verified."
+            ));
+        }
     }
 
     var userID = Guid.NewGuid().ToString();
@@ -80,17 +265,19 @@ app.MapPost("/api/users/register", async (RegisterUserRequest request, AlloChatD
     {
         UserID = userID,
         AlloCode = alloCode,
-        FirstName = request.FirstName.Trim(),
-        LastName = request.LastName.Trim(),
-        Nickname = request.Nickname?.Trim() ?? "",
-        PhoneNumber = request.PhoneNumber?.Trim() ?? "",
-        AvatarSystemName = request.AvatarSystemName?.Trim() ?? "",
-        Availability = request.Availability?.Trim() ?? "Available",
+        FirstName = cleanFirstName,
+        LastName = cleanLastName,
+        Nickname = cleanNickname,
+        PhoneNumber = cleanPhoneNumber,
+        AvatarSystemName = cleanAvatarSystemName,
+        Availability = cleanAvailability,
         CreatedAt = DateTime.UtcNow
     };
 
     db.Users.Add(user);
     await db.SaveChangesAsync();
+
+    verifiedPhoneNumbers.TryRemove(cleanPhoneNumber, out _);
 
     var response = new RegisterUserResponse(
         user.UserID,
@@ -394,6 +581,31 @@ static string BuildDisplayName(RegisteredUserEntity user)
     return string.IsNullOrWhiteSpace(fullName) ? "AlloChat" : fullName;
 }
 
+static bool IsTestPhoneNumber(string phoneNumber)
+{
+    return !string.IsNullOrWhiteSpace(phoneNumber) &&
+           phoneNumber.Trim().StartsWith("TEST-", StringComparison.OrdinalIgnoreCase);
+}
+
+static bool IsLikelyInternationalPhoneNumber(string phoneNumber)
+{
+    if (string.IsNullOrWhiteSpace(phoneNumber))
+    {
+        return false;
+    }
+
+    var clean = phoneNumber.Trim();
+
+    if (!clean.StartsWith("+"))
+    {
+        return false;
+    }
+
+    var digits = clean.Skip(1).Where(char.IsDigit).ToArray();
+
+    return digits.Length >= 8 && digits.Length <= 15 && clean.Skip(1).All(char.IsDigit);
+}
+
 static void EnsureDeviceTokensTable(AlloChatDbContext db)
 {
     db.Database.ExecuteSqlRaw("""
@@ -419,8 +631,6 @@ static void EnsureDeviceTokensTable(AlloChatDbContext db)
         ON "DeviceTokens" ("UserID");
     """);
 }
-
-
 
 // -------- APNs --------
 
@@ -575,6 +785,9 @@ class AlloChatDbContext : DbContext
             .HasIndex(u => u.AlloCode)
             .IsUnique();
 
+        modelBuilder.Entity<RegisteredUserEntity>()
+            .HasIndex(u => u.PhoneNumber);
+
         modelBuilder.Entity<ChatMessageEntity>()
             .HasKey(m => m.MessageID);
 
@@ -636,6 +849,22 @@ record WeatherForecast(DateOnly Date, int TemperatureC, string? Summary)
 {
     public int TemperatureF => 32 + (int)(TemperatureC / 0.5556);
 }
+
+record PhoneVerificationRequest(
+    string PhoneNumber
+);
+
+record PhoneCodeValidationRequest(
+    string PhoneNumber,
+    string Code
+);
+
+record PhoneVerificationState(
+    string Code,
+    DateTime CreatedAt,
+    DateTime ExpiresAt,
+    int Attempts
+);
 
 record RegisterUserRequest(
     string FirstName,
