@@ -1,4 +1,4 @@
-﻿using System.Net.Http.Headers;
+using System.Net.Http.Headers;
 using System.Security.Cryptography;
 using System.Text;
 using System.Text.Json;
@@ -39,6 +39,7 @@ using (var scope = app.Services.CreateScope())
     var db = scope.ServiceProvider.GetRequiredService<AlloChatDbContext>();
     db.Database.EnsureCreated();
     EnsureDeviceTokensTable(db);
+    EnsureUserSessionColumns(db);
 }
 
 // Endpoint de test existant
@@ -72,6 +73,10 @@ app.MapPost("/api/users/register", async (RegisterUserRequest request, AlloChatD
         ? "Available"
         : request.Availability.Trim();
 
+    var cleanAvatarImageData = string.IsNullOrWhiteSpace(request.AvatarImageData)
+        ? null
+        : request.AvatarImageData.Trim();
+
     if (string.IsNullOrWhiteSpace(cleanFirstName) ||
         string.IsNullOrWhiteSpace(cleanLastName) ||
         string.IsNullOrWhiteSpace(cleanNickname))
@@ -95,6 +100,7 @@ app.MapPost("/api/users/register", async (RegisterUserRequest request, AlloChatD
         PhoneNumber = "",
         AvatarSystemName = cleanAvatarSystemName,
         Availability = cleanAvailability,
+        AvatarImageData = cleanAvatarImageData,
         CreatedAt = DateTime.UtcNow
     };
 
@@ -108,7 +114,8 @@ app.MapPost("/api/users/register", async (RegisterUserRequest request, AlloChatD
         user.LastName,
         user.Nickname,
         user.AvatarSystemName,
-        user.Availability
+        user.Availability,
+        user.AvatarImageData
     );
 
     return Results.Ok(response);
@@ -144,10 +151,69 @@ app.MapPost("/api/users/lookup", async (ContactLookupRequest request, AlloChatDb
         $"{user.FirstName} {user.LastName}".Trim(),
         user.Nickname,
         user.AvatarSystemName,
-        user.Availability
+        user.Availability,
+        user.AvatarImageData
     ));
 })
 .WithName("LookupContact")
+.WithOpenApi();
+
+
+app.MapPost("/api/accounts/restore", async (RestoreAccountRequest request, AlloChatDbContext db) =>
+{
+    var cleanUserID = request.UserID?.Trim() ?? "";
+    var cleanAlloCode = request.AlloCode?.Trim().ToUpperInvariant() ?? "";
+    var cleanDeviceID = request.DeviceID?.Trim() ?? "";
+
+    if (string.IsNullOrWhiteSpace(cleanUserID) ||
+        string.IsNullOrWhiteSpace(cleanAlloCode) ||
+        string.IsNullOrWhiteSpace(cleanDeviceID))
+    {
+        return Results.BadRequest(new StandardServerResponse(
+            false,
+            "UserID, AlloCode and DeviceID are required."
+        ));
+    }
+
+    var user = await db.Users.FirstOrDefaultAsync(u => u.UserID == cleanUserID);
+
+    if (user == null)
+    {
+        return Results.NotFound(new StandardServerResponse(
+            false,
+            "Account not found."
+        ));
+    }
+
+    if (!string.Equals(user.AlloCode.Trim(), cleanAlloCode, StringComparison.OrdinalIgnoreCase))
+    {
+        return Results.BadRequest(new StandardServerResponse(
+            false,
+            "Invalid backup identity."
+        ));
+    }
+
+    user.ActiveDeviceID = cleanDeviceID;
+    user.SessionVersion += 1;
+
+    await db.SaveChangesAsync();
+
+    return Results.Ok(new RestoreAccountResponse(
+        true,
+        "Account restored successfully.",
+        user.UserID,
+        user.AlloCode,
+        user.FirstName,
+        user.LastName,
+        user.Nickname,
+        user.AvatarSystemName,
+        user.Availability,
+        user.AvatarImageData,
+        user.ActiveDeviceID,
+        user.SessionVersion
+    ));
+})
+.WithName("RestoreAccount")
 .WithOpenApi();
 
 app.MapPost("/api/devices/register", async (RegisterDeviceRequest request, AlloChatDbContext db) =>
@@ -428,6 +494,25 @@ static void EnsureDeviceTokensTable(AlloChatDbContext db)
     """);
 }
 
+
+static void EnsureUserSessionColumns(AlloChatDbContext db)
+{
+    db.Database.ExecuteSqlRaw("""
+        ALTER TABLE "Users"
+        ADD COLUMN IF NOT EXISTS "ActiveDeviceID" text NOT NULL DEFAULT '';
+    """);
+
+    db.Database.ExecuteSqlRaw("""
+        ALTER TABLE "Users"
+        ADD COLUMN IF NOT EXISTS "SessionVersion" integer NOT NULL DEFAULT 1;
+    """);
+
+    db.Database.ExecuteSqlRaw("""
+        ALTER TABLE "Users"
+        ADD COLUMN IF NOT EXISTS "AvatarImageData" text NULL;
+    """);
+}
+
 // -------- APNs --------
 
 class ApnsPushService
@@ -615,6 +700,9 @@ class RegisteredUserEntity
     public string PhoneNumber { get; set; } = "";
     public string AvatarSystemName { get; set; } = "";
     public string Availability { get; set; } = "Available";
+    public string? AvatarImageData { get; set; }
+    public string ActiveDeviceID { get; set; } = "";
+    public int SessionVersion { get; set; } = 1;
     public DateTime CreatedAt { get; set; }
 }
 
@@ -652,7 +740,8 @@ record RegisterUserRequest(
     string LastName,
     string? Nickname,
     string? AvatarSystemName,
-    string? Availability
+    string? Availability,
+    string? AvatarImageData
 );
 
 record RegisterUserResponse(
@@ -662,7 +751,29 @@ record RegisterUserResponse(
     string LastName,
     string Nickname,
     string AvatarSystemName,
-    string Availability
+    string Availability,
+    string? AvatarImageData
+);
+
+record RestoreAccountRequest(
+    string UserID,
+    string AlloCode,
+    string DeviceID
+);
+
+record RestoreAccountResponse(
+    bool Success,
+    string Message,
+    string UserID,
+    string AlloCode,
+    string FirstName,
+    string LastName,
+    string Nickname,
+    string AvatarSystemName,
+    string Availability,
+    string? AvatarImageData,
+    string ActiveDeviceID,
+    int SessionVersion
 );
 
 record StandardServerResponse(
@@ -707,7 +818,8 @@ record ContactLookupResponse(
     string DisplayName,
     string Nickname,
     string AvatarSystemName,
-    string Availability
+    string Availability,
+    string? AvatarImageData
 );
 
 record RegisterDeviceRequest(
