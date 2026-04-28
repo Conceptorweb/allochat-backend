@@ -242,8 +242,12 @@ app.MapPost("/api/devices/register", async (RegisterDeviceRequest request, AlloC
         ? "watchOS"
         : request.Platform.Trim();
 
+    // IMPORTANT MULTI-PROFILE WATCH LOGIC:
+    // The same physical watch has one APNs device token, but it can contain several
+    // AlloChat profiles. Therefore the same token must be allowed for several UserID
+    // values. We only update the row for the exact pair (UserID + Token).
     var existingToken = await db.DeviceTokens
-        .FirstOrDefaultAsync(t => t.Token == cleanToken);
+        .FirstOrDefaultAsync(t => t.UserID == request.UserID && t.Token == cleanToken);
 
     if (existingToken == null)
     {
@@ -262,7 +266,6 @@ app.MapPost("/api/devices/register", async (RegisterDeviceRequest request, AlloC
     }
     else
     {
-        existingToken.UserID = request.UserID;
         existingToken.Platform = cleanPlatform;
         existingToken.IsActive = true;
         existingToken.LastSeenAt = DateTime.UtcNow;
@@ -680,14 +683,20 @@ static void EnsureDeviceTokensTable(AlloChatDbContext db)
         );
     """);
 
+    // Previous versions used a unique index on Token only. That breaks multi-profile
+    // watches because P1 and P2 on the same watch share the same APNs token.
     db.Database.ExecuteSqlRaw("""
-        CREATE UNIQUE INDEX IF NOT EXISTS "IX_DeviceTokens_Token"
-        ON "DeviceTokens" ("Token");
+        DROP INDEX IF EXISTS "IX_DeviceTokens_Token";
     """);
 
     db.Database.ExecuteSqlRaw("""
         CREATE INDEX IF NOT EXISTS "IX_DeviceTokens_UserID"
         ON "DeviceTokens" ("UserID");
+    """);
+
+    db.Database.ExecuteSqlRaw("""
+        CREATE UNIQUE INDEX IF NOT EXISTS "IX_DeviceTokens_UserID_Token"
+        ON "DeviceTokens" ("UserID", "Token");
     """);
 }
 
@@ -879,11 +888,11 @@ class AlloChatDbContext : DbContext
             .HasKey(t => t.DeviceTokenID);
 
         modelBuilder.Entity<DeviceTokenEntity>()
-            .HasIndex(t => t.Token)
-            .IsUnique();
+            .HasIndex(t => t.UserID);
 
         modelBuilder.Entity<DeviceTokenEntity>()
-            .HasIndex(t => t.UserID);
+            .HasIndex(t => new { t.UserID, t.Token })
+            .IsUnique();
     }
 }
 
