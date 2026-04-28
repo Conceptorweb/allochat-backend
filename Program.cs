@@ -352,6 +352,129 @@ app.MapPost("/api/messages/send", async (
 .WithName("SendMessage")
 .WithOpenApi();
 
+
+app.MapPost("/api/emergency/send", async (
+    EmergencyAlertRequest request,
+    AlloChatDbContext db,
+    ApnsPushService pushService
+) =>
+{
+    if (string.IsNullOrWhiteSpace(request.SenderID) ||
+        request.ReceiverIDs == null ||
+        !request.ReceiverIDs.Any() ||
+        string.IsNullOrWhiteSpace(request.Content))
+    {
+        return Results.BadRequest(new EmergencyAlertResponse(
+            false,
+            "Invalid emergency alert data.",
+            0,
+            request.ReceiverIDs?.Count ?? 0
+        ));
+    }
+
+    var sender = await db.Users.FirstOrDefaultAsync(u => u.UserID == request.SenderID);
+
+    if (sender == null)
+    {
+        return Results.NotFound(new EmergencyAlertResponse(
+            false,
+            "Sender not found.",
+            0,
+            request.ReceiverIDs.Count
+        ));
+    }
+
+    var cleanReceiverIDs = request.ReceiverIDs
+        .Where(id => !string.IsNullOrWhiteSpace(id))
+        .Select(id => id.Trim())
+        .Distinct()
+        .ToList();
+
+    var receivers = await db.Users
+        .Where(u => cleanReceiverIDs.Contains(u.UserID))
+        .ToListAsync();
+
+    if (!receivers.Any())
+    {
+        return Results.NotFound(new EmergencyAlertResponse(
+            false,
+            "No valid emergency recipients found.",
+            0,
+            cleanReceiverIDs.Count
+        ));
+    }
+
+    var senderName = string.IsNullOrWhiteSpace(request.SenderName)
+        ? BuildDisplayName(sender)
+        : request.SenderName.Trim();
+
+    var cleanContent = request.Content.Trim();
+
+    foreach (var receiver in receivers)
+    {
+        db.Messages.Add(new ChatMessageEntity
+        {
+            MessageID = Guid.NewGuid().ToString(),
+            SenderID = request.SenderID,
+            ReceiverID = receiver.UserID,
+            Content = cleanContent,
+            SentAt = DateTime.UtcNow,
+            Delivered = false
+        });
+    }
+
+    await db.SaveChangesAsync();
+
+    var receiverUserIDs = receivers.Select(r => r.UserID).ToList();
+
+    var receiverTokens = await db.DeviceTokens
+        .Where(t => receiverUserIDs.Contains(t.UserID) && t.IsActive)
+        .ToListAsync();
+
+    var pushTitle = $"🚨 Emergency from {senderName}";
+    var pushBody = $"{senderName} sent you an emergency alert with their location.";
+
+    var pushSuccessCount = 0;
+    var pushFailureCount = 0;
+
+    foreach (var token in receiverTokens)
+    {
+        var pushResult = await pushService.SendMessageNotificationAsync(
+            deviceToken: token.Token,
+            title: pushTitle,
+            body: pushBody
+        );
+
+        if (pushResult.Success)
+        {
+            pushSuccessCount += 1;
+        }
+        else
+        {
+            pushFailureCount += 1;
+
+            if (pushResult.StatusCode == 400 || pushResult.StatusCode == 410)
+            {
+                token.IsActive = false;
+            }
+        }
+    }
+
+    if (receiverTokens.Any(t => !t.IsActive))
+    {
+        await db.SaveChangesAsync();
+    }
+
+    return Results.Ok(new EmergencyAlertResponse(
+        true,
+        $"Emergency alert sent to {receivers.Count} contact(s).",
+        pushSuccessCount,
+        pushFailureCount
+    ));
+})
+.WithName("SendEmergencyAlert")
+.WithOpenApi();
+
 app.MapGet("/api/messages/pending/{userID}", async (string userID, AlloChatDbContext db) =>
 {
     if (string.IsNullOrWhiteSpace(userID))
@@ -790,6 +913,23 @@ record SendMessageRequest(
 record SendMessageResponse(
     bool Success,
     string Message
+);
+
+
+record EmergencyAlertRequest(
+    string SenderID,
+    List<string> ReceiverIDs,
+    string SenderName,
+    double? Latitude,
+    double? Longitude,
+    string Content
+);
+
+record EmergencyAlertResponse(
+    bool Success,
+    string Message,
+    int SentCount,
+    int FailedCount
 );
 
 record PendingMessageItem(
