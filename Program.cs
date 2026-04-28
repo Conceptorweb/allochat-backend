@@ -555,6 +555,21 @@ app.MapPost("/api/messages/acknowledge", async (AcknowledgeMessageRequest reques
 .WithName("AcknowledgeMessages")
 .WithOpenApi();
 
+
+app.MapGet("/debug/tokens", async (AlloChatDbContext db) =>
+{
+    var tokens = await db.DeviceTokens
+        .Select(t => new
+        {
+            t.UserID,
+            TokenStart = t.Token.Substring(0, 12),
+            t.IsActive
+        })
+        .ToListAsync();
+
+    return Results.Ok(tokens);
+});
+
 var port = Environment.GetEnvironmentVariable("PORT") ?? "10000";
 app.Run($"http://0.0.0.0:{port}");
 
@@ -1117,3 +1132,5 @@ static class Utils
             .Replace('/', '_');
     }
 }
+
+
