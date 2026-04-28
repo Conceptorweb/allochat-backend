@@ -218,63 +218,93 @@ app.MapPost("/api/accounts/restore", async (RestoreAccountRequest request, AlloC
 
 app.MapPost("/api/devices/register", async (RegisterDeviceRequest request, AlloChatDbContext db) =>
 {
-    if (string.IsNullOrWhiteSpace(request.UserID) ||
-        string.IsNullOrWhiteSpace(request.DeviceToken))
+    if (string.IsNullOrWhiteSpace(request.DeviceID) ||
+        string.IsNullOrWhiteSpace(request.DeviceToken) ||
+        request.ProfileUserIDs == null ||
+        !request.ProfileUserIDs.Any())
     {
         return Results.BadRequest(new StandardServerResponse(
             false,
-            "UserID and DeviceToken are required."
+            "DeviceID, DeviceToken and ProfileUserIDs are required."
         ));
     }
 
-    var userExists = await db.Users.AnyAsync(u => u.UserID == request.UserID);
-
-    if (!userExists)
-    {
-        return Results.NotFound(new StandardServerResponse(
-            false,
-            "User not found."
-        ));
-    }
-
+    var cleanDeviceID = request.DeviceID.Trim();
     var cleanToken = request.DeviceToken.Trim();
     var cleanPlatform = string.IsNullOrWhiteSpace(request.Platform)
         ? "watchOS"
         : request.Platform.Trim();
 
-    // IMPORTANT MULTI-PROFILE WATCH LOGIC:
-    // One Apple Watch has one APNs token, but it can contain several AlloChat profiles.
-    // Therefore we must store one row per pair (UserID + Token), not one row per Token.
-    var existingToken = await db.DeviceTokens
-        .FirstOrDefaultAsync(t => t.UserID == request.UserID && t.Token == cleanToken);
+    var cleanProfileUserIDs = request.ProfileUserIDs
+        .Where(id => !string.IsNullOrWhiteSpace(id))
+        .Select(id => id.Trim())
+        .Distinct()
+        .ToList();
 
-    if (existingToken == null)
+    if (!cleanProfileUserIDs.Any())
     {
-        var deviceToken = new DeviceTokenEntity
-        {
-            DeviceTokenID = Guid.NewGuid().ToString(),
-            UserID = request.UserID,
-            Token = cleanToken,
-            Platform = cleanPlatform,
-            IsActive = true,
-            CreatedAt = DateTime.UtcNow,
-            LastSeenAt = DateTime.UtcNow
-        };
-
-        db.DeviceTokens.Add(deviceToken);
+        return Results.BadRequest(new StandardServerResponse(
+            false,
+            "At least one valid profile userID is required."
+        ));
     }
-    else
+
+    var existingUserIDs = await db.Users
+        .Where(u => cleanProfileUserIDs.Contains(u.UserID))
+        .Select(u => u.UserID)
+        .ToListAsync();
+
+    if (!existingUserIDs.Any())
     {
-        existingToken.Platform = cleanPlatform;
-        existingToken.IsActive = true;
-        existingToken.LastSeenAt = DateTime.UtcNow;
+        return Results.NotFound(new StandardServerResponse(
+            false,
+            "No valid profiles found for this device."
+        ));
+    }
+
+    var existingRowsForDevice = await db.DeviceTokens
+        .Where(t => t.DeviceID == cleanDeviceID)
+        .ToListAsync();
+
+    foreach (var row in existingRowsForDevice)
+    {
+        row.IsActive = false;
+        row.LastSeenAt = DateTime.UtcNow;
+    }
+
+    foreach (var userID in existingUserIDs)
+    {
+        var existingRow = existingRowsForDevice
+            .FirstOrDefault(t => t.UserID == userID);
+
+        if (existingRow == null)
+        {
+            db.DeviceTokens.Add(new DeviceTokenEntity
+            {
+                DeviceTokenID = Guid.NewGuid().ToString(),
+                DeviceID = cleanDeviceID,
+                UserID = userID,
+                Token = cleanToken,
+                Platform = cleanPlatform,
+                IsActive = true,
+                CreatedAt = DateTime.UtcNow,
+                LastSeenAt = DateTime.UtcNow
+            });
+        }
+        else
+        {
+            existingRow.Token = cleanToken;
+            existingRow.Platform = cleanPlatform;
+            existingRow.IsActive = true;
+            existingRow.LastSeenAt = DateTime.UtcNow;
+        }
     }
 
     await db.SaveChangesAsync();
 
     return Results.Ok(new StandardServerResponse(
         true,
-        "Device token registered."
+        $"Device token registered for {existingUserIDs.Count} profile(s)."
     ));
 })
 .WithName("RegisterDeviceToken")
@@ -555,21 +585,6 @@ app.MapPost("/api/messages/acknowledge", async (AcknowledgeMessageRequest reques
 .WithName("AcknowledgeMessages")
 .WithOpenApi();
 
-
-app.MapGet("/debug/tokens", async (AlloChatDbContext db) =>
-{
-    var tokens = await db.DeviceTokens
-        .Select(t => new
-        {
-            t.UserID,
-            TokenStart = t.Token.Substring(0, 12),
-            t.IsActive
-        })
-        .ToListAsync();
-
-    return Results.Ok(tokens);
-});
-
 var port = Environment.GetEnvironmentVariable("PORT") ?? "10000";
 app.Run($"http://0.0.0.0:{port}");
 
@@ -700,33 +715,12 @@ static async Task<List<DeviceTokenEntity>> GetPushTokensForUserIDsAsync(
         return new List<DeviceTokenEntity>();
     }
 
-    // First get the active APNs tokens directly linked to the target user(s).
-    var directTokens = await db.DeviceTokens
+    return await db.DeviceTokens
         .Where(t => cleanUserIDs.Contains(t.UserID) && t.IsActive)
-        .ToListAsync();
-
-    var tokenValues = directTokens
-        .Select(t => t.Token)
-        .Where(token => !string.IsNullOrWhiteSpace(token))
-        .Distinct()
-        .ToList();
-
-    if (!tokenValues.Any())
-    {
-        return new List<DeviceTokenEntity>();
-    }
-
-    // Multi-profile Apple Watch support:
-    // the same physical watch APNs token can be registered for P1, P2, P3.
-    // We fetch all active rows sharing these token values, then send once per token.
-    var sharedTokenRows = await db.DeviceTokens
-        .Where(t => tokenValues.Contains(t.Token) && t.IsActive)
-        .ToListAsync();
-
-    return sharedTokenRows
+        .Where(t => !string.IsNullOrWhiteSpace(t.Token))
         .GroupBy(t => t.Token)
         .Select(group => group.First())
-        .ToList();
+        .ToListAsync();
 }
 
 static void EnsureDeviceTokensTable(AlloChatDbContext db)
@@ -734,6 +728,7 @@ static void EnsureDeviceTokensTable(AlloChatDbContext db)
     db.Database.ExecuteSqlRaw("""
         CREATE TABLE IF NOT EXISTS "DeviceTokens" (
             "DeviceTokenID" text NOT NULL,
+            "DeviceID" text NOT NULL DEFAULT '',
             "UserID" text NOT NULL,
             "Token" text NOT NULL,
             "Platform" text NOT NULL,
@@ -744,15 +739,17 @@ static void EnsureDeviceTokensTable(AlloChatDbContext db)
         );
     """);
 
-    // Old versions used a UNIQUE index on Token only. That breaks multi-profile watches
-    // because the same physical watch token must be allowed for P1, P2, P3.
+    db.Database.ExecuteSqlRaw("""
+        ALTER TABLE "DeviceTokens"
+        ADD COLUMN IF NOT EXISTS "DeviceID" text NOT NULL DEFAULT '';
+    """);
+
     db.Database.ExecuteSqlRaw("""
         DROP INDEX IF EXISTS "IX_DeviceTokens_Token";
     """);
 
     db.Database.ExecuteSqlRaw("""
-        CREATE INDEX IF NOT EXISTS "IX_DeviceTokens_Token"
-        ON "DeviceTokens" ("Token");
+        DROP INDEX IF EXISTS "IX_DeviceTokens_UserID_Token";
     """);
 
     db.Database.ExecuteSqlRaw("""
@@ -761,11 +758,20 @@ static void EnsureDeviceTokensTable(AlloChatDbContext db)
     """);
 
     db.Database.ExecuteSqlRaw("""
-        CREATE UNIQUE INDEX IF NOT EXISTS "IX_DeviceTokens_UserID_Token"
-        ON "DeviceTokens" ("UserID", "Token");
+        CREATE INDEX IF NOT EXISTS "IX_DeviceTokens_DeviceID"
+        ON "DeviceTokens" ("DeviceID");
+    """);
+
+    db.Database.ExecuteSqlRaw("""
+        CREATE INDEX IF NOT EXISTS "IX_DeviceTokens_Token"
+        ON "DeviceTokens" ("Token");
+    """);
+
+    db.Database.ExecuteSqlRaw("""
+        CREATE INDEX IF NOT EXISTS "IX_DeviceTokens_DeviceID_UserID"
+        ON "DeviceTokens" ("DeviceID", "UserID");
     """);
 }
-
 
 static void EnsureUserSessionColumns(AlloChatDbContext db)
 {
@@ -960,8 +966,10 @@ class AlloChatDbContext : DbContext
             .HasIndex(t => t.UserID);
 
         modelBuilder.Entity<DeviceTokenEntity>()
-            .HasIndex(t => new { t.UserID, t.Token })
-            .IsUnique();
+            .HasIndex(t => t.DeviceID);
+
+        modelBuilder.Entity<DeviceTokenEntity>()
+            .HasIndex(t => new { t.DeviceID, t.UserID });
     }
 }
 
@@ -994,6 +1002,7 @@ class ChatMessageEntity
 class DeviceTokenEntity
 {
     public string DeviceTokenID { get; set; } = "";
+    public string DeviceID { get; set; } = "";
     public string UserID { get; set; } = "";
     public string Token { get; set; } = "";
     public string Platform { get; set; } = "watchOS";
@@ -1117,8 +1126,9 @@ record ContactLookupResponse(
 );
 
 record RegisterDeviceRequest(
-    string UserID,
+    string DeviceID,
     string DeviceToken,
+    List<string> ProfileUserIDs,
     string? Platform
 );
 
@@ -1132,5 +1142,3 @@ static class Utils
             .Replace('/', '_');
     }
 }
-
-
