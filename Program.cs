@@ -485,17 +485,37 @@ app.MapGet("/api/messages/pending/{userID}", async (string userID, AlloChatDbCon
         ));
     }
 
-    var pending = await db.Messages
+    var pendingEntities = await db.Messages
         .Where(m => m.ReceiverID == userID && !m.Delivered)
         .OrderBy(m => m.SentAt)
-        .Select(m => new PendingMessageItem(
-            m.MessageID,
-            m.SenderID,
-            m.ReceiverID,
-            m.Content,
-            m.SentAt
-        ))
         .ToListAsync();
+
+    var senderIDs = pendingEntities
+        .Select(m => m.SenderID)
+        .Where(id => !string.IsNullOrWhiteSpace(id))
+        .Distinct()
+        .ToList();
+
+    var senders = await db.Users
+        .Where(u => senderIDs.Contains(u.UserID))
+        .ToDictionaryAsync(u => u.UserID);
+
+    var pending = pendingEntities
+        .Select(m =>
+        {
+            senders.TryGetValue(m.SenderID, out var sender);
+
+            return new PendingMessageItem(
+                m.MessageID,
+                m.SenderID,
+                m.ReceiverID,
+                m.Content,
+                m.SentAt,
+                sender == null ? "" : BuildDisplayName(sender),
+                sender?.AlloCode ?? ""
+            );
+        })
+        .ToList();
 
     return Results.Ok(new PendingMessagesResponse(pending));
 })
@@ -907,7 +927,8 @@ record StandardServerResponse(
 record SendMessageRequest(
     string SenderID,
     string ReceiverID,
-    string Content
+    string Content,
+    string? SenderDisplayName
 );
 
 record SendMessageResponse(
@@ -937,7 +958,9 @@ record PendingMessageItem(
     string SenderID,
     string ReceiverID,
     string Content,
-    DateTime SentAt
+    DateTime SentAt,
+    string SenderDisplayName,
+    string SenderAlloCode
 );
 
 record PendingMessagesResponse(
