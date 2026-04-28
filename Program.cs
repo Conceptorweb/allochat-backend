@@ -322,14 +322,19 @@ app.MapPost("/api/messages/send", async (
         .Where(t => t.UserID == request.ReceiverID && t.IsActive)
         .ToListAsync();
 
-    var senderName = BuildDisplayName(sender);
+    var senderName = string.IsNullOrWhiteSpace(request.SenderDisplayName)
+        ? BuildDisplayName(sender)
+        : request.SenderDisplayName.Trim();
+
+    var pushTitle = PushTitleForMessage(message.Content, senderName);
+    var pushBody = PushBodyForMessage(message.Content, senderName);
 
     foreach (var token in receiverTokens)
     {
         var pushResult = await pushService.SendMessageNotificationAsync(
             deviceToken: token.Token,
-            title: senderName,
-            body: message.Content
+            title: pushTitle,
+            body: pushBody
         );
 
         if (!pushResult.Success &&
@@ -432,7 +437,9 @@ app.MapPost("/api/emergency/send", async (
         .ToListAsync();
 
     var pushTitle = $"🚨 Emergency from {senderName}";
-    var pushBody = $"{senderName} sent you an emergency alert with their location.";
+    var pushBody = request.Latitude.HasValue && request.Longitude.HasValue
+        ? $"{senderName} needs help. Location: https://maps.apple.com/?ll={request.Latitude.Value.ToString(System.Globalization.CultureInfo.InvariantCulture)},{request.Longitude.Value.ToString(System.Globalization.CultureInfo.InvariantCulture)}"
+        : $"{senderName} needs help. Location unavailable.";
 
     var pushSuccessCount = 0;
     var pushFailureCount = 0;
@@ -492,7 +499,6 @@ app.MapGet("/api/messages/pending/{userID}", async (string userID, AlloChatDbCon
 
     var senderIDs = pendingEntities
         .Select(m => m.SenderID)
-        .Where(id => !string.IsNullOrWhiteSpace(id))
         .Distinct()
         .ToList();
 
@@ -501,20 +507,14 @@ app.MapGet("/api/messages/pending/{userID}", async (string userID, AlloChatDbCon
         .ToDictionaryAsync(u => u.UserID);
 
     var pending = pendingEntities
-        .Select(m =>
-        {
-            senders.TryGetValue(m.SenderID, out var sender);
-
-            return new PendingMessageItem(
-                m.MessageID,
-                m.SenderID,
-                m.ReceiverID,
-                m.Content,
-                m.SentAt,
-                sender == null ? "" : BuildDisplayName(sender),
-                sender?.AlloCode ?? ""
-            );
-        })
+        .Select(m => new PendingMessageItem(
+            m.MessageID,
+            m.SenderID,
+            m.ReceiverID,
+            m.Content,
+            m.SentAt,
+            senders.TryGetValue(m.SenderID, out var sender) ? BuildDisplayName(sender) : "AlloChat"
+        ))
         .ToList();
 
     return Results.Ok(new PendingMessagesResponse(pending));
@@ -608,6 +608,60 @@ static string BuildDisplayName(RegisteredUserEntity user)
     var fullName = $"{user.FirstName} {user.LastName}".Trim();
 
     return string.IsNullOrWhiteSpace(fullName) ? "AlloChat" : fullName;
+}
+
+static string PushTitleForMessage(string content, string senderName)
+{
+    var cleanContent = content?.Trim() ?? "";
+
+    if (cleanContent.StartsWith("[PING]"))
+    {
+        return $"Ping from {senderName}";
+    }
+
+    if (cleanContent.StartsWith("[EMERGENCY]"))
+    {
+        return $"🚨 Emergency from {senderName}";
+    }
+
+    return senderName;
+}
+
+static string PushBodyForMessage(string content, string senderName)
+{
+    var cleanContent = content?.Trim() ?? "";
+
+    if (cleanContent.StartsWith("[PING]"))
+    {
+        return $"{senderName} sent you a ping.";
+    }
+
+    if (cleanContent.StartsWith("[EMERGENCY]"))
+    {
+        return $"{senderName} sent you an emergency alert. Open AlloChat for the location.";
+    }
+
+    if (cleanContent.StartsWith("[CONTACT]"))
+    {
+        return $"{senderName} shared a contact with you.";
+    }
+
+    if (cleanContent.StartsWith("[ALLOCODE]"))
+    {
+        return $"{senderName} shared an AlloCode invitation.";
+    }
+
+    if (cleanContent.StartsWith("[LOCATION]"))
+    {
+        return $"{senderName} shared a location.";
+    }
+
+    if (cleanContent.Length > 120)
+    {
+        return cleanContent.Substring(0, 117) + "...";
+    }
+
+    return cleanContent;
 }
 
 
@@ -959,8 +1013,7 @@ record PendingMessageItem(
     string ReceiverID,
     string Content,
     DateTime SentAt,
-    string SenderDisplayName,
-    string SenderAlloCode
+    string? SenderDisplayName
 );
 
 record PendingMessagesResponse(
