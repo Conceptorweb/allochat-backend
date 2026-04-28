@@ -243,9 +243,8 @@ app.MapPost("/api/devices/register", async (RegisterDeviceRequest request, AlloC
         : request.Platform.Trim();
 
     // IMPORTANT MULTI-PROFILE WATCH LOGIC:
-    // The same physical watch has one APNs device token, but it can contain several
-    // AlloChat profiles. Therefore the same token must be allowed for several UserID
-    // values. We only update the row for the exact pair (UserID + Token).
+    // One Apple Watch has one APNs token, but it can contain several AlloChat profiles.
+    // Therefore we must store one row per pair (UserID + Token), not one row per Token.
     var existingToken = await db.DeviceTokens
         .FirstOrDefaultAsync(t => t.UserID == request.UserID && t.Token == cleanToken);
 
@@ -683,10 +682,15 @@ static void EnsureDeviceTokensTable(AlloChatDbContext db)
         );
     """);
 
-    // Previous versions used a unique index on Token only. That breaks multi-profile
-    // watches because P1 and P2 on the same watch share the same APNs token.
+    // Old versions used a UNIQUE index on Token only. That breaks multi-profile watches
+    // because the same physical watch token must be allowed for P1, P2, P3.
     db.Database.ExecuteSqlRaw("""
         DROP INDEX IF EXISTS "IX_DeviceTokens_Token";
+    """);
+
+    db.Database.ExecuteSqlRaw("""
+        CREATE INDEX IF NOT EXISTS "IX_DeviceTokens_Token"
+        ON "DeviceTokens" ("Token");
     """);
 
     db.Database.ExecuteSqlRaw("""
@@ -886,6 +890,9 @@ class AlloChatDbContext : DbContext
 
         modelBuilder.Entity<DeviceTokenEntity>()
             .HasKey(t => t.DeviceTokenID);
+
+        modelBuilder.Entity<DeviceTokenEntity>()
+            .HasIndex(t => t.Token);
 
         modelBuilder.Entity<DeviceTokenEntity>()
             .HasIndex(t => t.UserID);
