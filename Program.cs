@@ -6,11 +6,9 @@ using Microsoft.EntityFrameworkCore;
 
 var builder = WebApplication.CreateBuilder(args);
 
-// Swagger / OpenAPI
 builder.Services.AddEndpointsApiExplorer();
 builder.Services.AddSwaggerGen();
 
-// PostgreSQL / Entity Framework
 var databaseUrl = Environment.GetEnvironmentVariable("DATABASE_URL");
 
 if (string.IsNullOrWhiteSpace(databaseUrl))
@@ -29,20 +27,18 @@ builder.Services.AddHttpClient<ApnsPushService>();
 
 var app = builder.Build();
 
-// Swagger actif aussi en production
 app.UseSwagger();
 app.UseSwaggerUI();
 
-// Création automatique des tables si elles n'existent pas
 using (var scope = app.Services.CreateScope())
 {
     var db = scope.ServiceProvider.GetRequiredService<AlloChatDbContext>();
     db.Database.EnsureCreated();
-    EnsureDeviceTokensTable(db);
+    EnsureLegacyDeviceTokensTable(db);
+    EnsurePushDeviceTables(db);
     EnsureUserSessionColumns(db);
 }
 
-// Endpoint de test existant
 var summaries = new[]
 {
     "Freezing", "Bracing", "Chilly", "Cool", "Mild", "Warm", "Balmy", "Hot", "Sweltering", "Scorching"
@@ -107,7 +103,7 @@ app.MapPost("/api/users/register", async (RegisterUserRequest request, AlloChatD
     db.Users.Add(user);
     await db.SaveChangesAsync();
 
-    var response = new RegisterUserResponse(
+    return Results.Ok(new RegisterUserResponse(
         user.UserID,
         user.AlloCode,
         user.FirstName,
@@ -116,9 +112,7 @@ app.MapPost("/api/users/register", async (RegisterUserRequest request, AlloChatD
         user.AvatarSystemName,
         user.Availability,
         user.AvatarImageData
-    );
-
-    return Results.Ok(response);
+    ));
 })
 .WithName("RegisterUser")
 .WithOpenApi();
@@ -134,7 +128,6 @@ app.MapPost("/api/users/lookup", async (ContactLookupRequest request, AlloChatDb
     }
 
     var cleanCode = request.AlloCode.Trim().ToUpperInvariant();
-
     var user = await db.Users.FirstOrDefaultAsync(u => u.AlloCode.ToUpper() == cleanCode);
 
     if (user == null)
@@ -157,7 +150,6 @@ app.MapPost("/api/users/lookup", async (ContactLookupRequest request, AlloChatDb
 })
 .WithName("LookupContact")
 .WithOpenApi();
-
 
 app.MapPost("/api/accounts/restore", async (RestoreAccountRequest request, AlloChatDbContext db) =>
 {
@@ -218,10 +210,21 @@ app.MapPost("/api/accounts/restore", async (RestoreAccountRequest request, AlloC
 
 app.MapPost("/api/devices/register", async (RegisterDeviceRequest request, AlloChatDbContext db) =>
 {
-    if (string.IsNullOrWhiteSpace(request.DeviceID) ||
-        string.IsNullOrWhiteSpace(request.DeviceToken) ||
-        request.ProfileUserIDs == null ||
-        !request.ProfileUserIDs.Any())
+    var cleanDeviceID = request.DeviceID?.Trim() ?? "";
+    var cleanToken = request.DeviceToken?.Trim() ?? "";
+    var cleanPlatform = string.IsNullOrWhiteSpace(request.Platform)
+        ? "watchOS"
+        : request.Platform.Trim();
+
+    var cleanProfileUserIDs = (request.ProfileUserIDs ?? new List<string>())
+        .Where(id => !string.IsNullOrWhiteSpace(id))
+        .Select(id => id.Trim())
+        .Distinct()
+        .ToList();
+
+    if (string.IsNullOrWhiteSpace(cleanDeviceID) ||
+        string.IsNullOrWhiteSpace(cleanToken) ||
+        !cleanProfileUserIDs.Any())
     {
         return Results.BadRequest(new StandardServerResponse(
             false,
@@ -229,85 +232,69 @@ app.MapPost("/api/devices/register", async (RegisterDeviceRequest request, AlloC
         ));
     }
 
-    var cleanDeviceID = request.DeviceID.Trim();
-    var cleanToken = request.DeviceToken.Trim();
-    var cleanPlatform = string.IsNullOrWhiteSpace(request.Platform)
-        ? "watchOS"
-        : request.Platform.Trim();
-
-    var cleanProfileUserIDs = request.ProfileUserIDs
-        .Where(id => !string.IsNullOrWhiteSpace(id))
-        .Select(id => id.Trim())
-        .Distinct()
-        .ToList();
-
-    if (!cleanProfileUserIDs.Any())
-    {
-        return Results.BadRequest(new StandardServerResponse(
-            false,
-            "At least one valid profile userID is required."
-        ));
-    }
-
-    var existingUserIDs = await db.Users
+    var validProfileUserIDs = await db.Users
         .Where(u => cleanProfileUserIDs.Contains(u.UserID))
         .Select(u => u.UserID)
         .ToListAsync();
 
-    if (!existingUserIDs.Any())
+    if (!validProfileUserIDs.Any())
     {
         return Results.NotFound(new StandardServerResponse(
             false,
-            "No valid profiles found for this device."
+            "No valid local profiles found for this device."
         ));
     }
 
-    var existingRowsForDevice = await db.DeviceTokens
-        .Where(t => t.DeviceID == cleanDeviceID)
-        .ToListAsync();
+    var existingDevice = await db.PushDevices
+        .FirstOrDefaultAsync(d => d.DeviceID == cleanDeviceID);
 
-    foreach (var row in existingRowsForDevice)
+    if (existingDevice == null)
     {
-        row.IsActive = false;
-        row.LastSeenAt = DateTime.UtcNow;
+        existingDevice = new PushDeviceEntity
+        {
+            DeviceID = cleanDeviceID,
+            Token = cleanToken,
+            Platform = cleanPlatform,
+            IsActive = true,
+            CreatedAt = DateTime.UtcNow,
+            LastSeenAt = DateTime.UtcNow
+        };
+
+        db.PushDevices.Add(existingDevice);
+    }
+    else
+    {
+        existingDevice.Token = cleanToken;
+        existingDevice.Platform = cleanPlatform;
+        existingDevice.IsActive = true;
+        existingDevice.LastSeenAt = DateTime.UtcNow;
     }
 
-    foreach (var userID in existingUserIDs)
-    {
-        var existingRow = existingRowsForDevice
-            .FirstOrDefault(t => t.UserID == userID);
+    var oldLinks = await db.PushDeviceProfiles
+        .Where(link => link.DeviceID == cleanDeviceID)
+        .ToListAsync();
 
-        if (existingRow == null)
+    db.PushDeviceProfiles.RemoveRange(oldLinks);
+
+    foreach (var userID in validProfileUserIDs)
+    {
+        db.PushDeviceProfiles.Add(new PushDeviceProfileEntity
         {
-            db.DeviceTokens.Add(new DeviceTokenEntity
-            {
-                DeviceTokenID = Guid.NewGuid().ToString(),
-                DeviceID = cleanDeviceID,
-                UserID = userID,
-                Token = cleanToken,
-                Platform = cleanPlatform,
-                IsActive = true,
-                CreatedAt = DateTime.UtcNow,
-                LastSeenAt = DateTime.UtcNow
-            });
-        }
-        else
-        {
-            existingRow.Token = cleanToken;
-            existingRow.Platform = cleanPlatform;
-            existingRow.IsActive = true;
-            existingRow.LastSeenAt = DateTime.UtcNow;
-        }
+            PushDeviceProfileID = Guid.NewGuid().ToString(),
+            DeviceID = cleanDeviceID,
+            UserID = userID,
+            CreatedAt = DateTime.UtcNow
+        });
     }
 
     await db.SaveChangesAsync();
 
     return Results.Ok(new StandardServerResponse(
         true,
-        $"Device token registered for {existingUserIDs.Count} profile(s)."
+        "Device registered."
     ));
 })
-.WithName("RegisterDeviceToken")
+.WithName("RegisterDevice")
 .WithOpenApi();
 
 app.MapPost("/api/messages/send", async (
@@ -350,7 +337,7 @@ app.MapPost("/api/messages/send", async (
     db.Messages.Add(message);
     await db.SaveChangesAsync();
 
-    var receiverTokens = await GetPushTokensForUserIDsAsync(
+    var receiverDevices = await GetPushDevicesForUserIDsAsync(
         db,
         new List<string> { request.ReceiverID }
     );
@@ -362,10 +349,10 @@ app.MapPost("/api/messages/send", async (
     var pushTitle = PushTitleForMessage(message.Content, senderName);
     var pushBody = PushBodyForMessage(message.Content, senderName);
 
-    foreach (var token in receiverTokens)
+    foreach (var device in receiverDevices)
     {
         var pushResult = await pushService.SendMessageNotificationAsync(
-            deviceToken: token.Token,
+            deviceToken: device.Token,
             title: pushTitle,
             body: pushBody
         );
@@ -373,11 +360,11 @@ app.MapPost("/api/messages/send", async (
         if (!pushResult.Success &&
             (pushResult.StatusCode == 400 || pushResult.StatusCode == 410))
         {
-            token.IsActive = false;
+            device.IsActive = false;
         }
     }
 
-    if (receiverTokens.Any(t => !t.IsActive))
+    if (receiverDevices.Any(d => !d.IsActive))
     {
         await db.SaveChangesAsync();
     }
@@ -389,7 +376,6 @@ app.MapPost("/api/messages/send", async (
 })
 .WithName("SendMessage")
 .WithOpenApi();
-
 
 app.MapPost("/api/emergency/send", async (
     EmergencyAlertRequest request,
@@ -464,11 +450,7 @@ app.MapPost("/api/emergency/send", async (
     await db.SaveChangesAsync();
 
     var receiverUserIDs = receivers.Select(r => r.UserID).ToList();
-
-    var receiverTokens = await GetPushTokensForUserIDsAsync(
-        db,
-        receiverUserIDs
-    );
+    var receiverDevices = await GetPushDevicesForUserIDsAsync(db, receiverUserIDs);
 
     var pushTitle = $"🚨 Emergency from {senderName}";
     var pushBody = request.Latitude.HasValue && request.Longitude.HasValue
@@ -478,10 +460,10 @@ app.MapPost("/api/emergency/send", async (
     var pushSuccessCount = 0;
     var pushFailureCount = 0;
 
-    foreach (var token in receiverTokens)
+    foreach (var device in receiverDevices)
     {
         var pushResult = await pushService.SendMessageNotificationAsync(
-            deviceToken: token.Token,
+            deviceToken: device.Token,
             title: pushTitle,
             body: pushBody
         );
@@ -496,12 +478,12 @@ app.MapPost("/api/emergency/send", async (
 
             if (pushResult.StatusCode == 400 || pushResult.StatusCode == 410)
             {
-                token.IsActive = false;
+                device.IsActive = false;
             }
         }
     }
 
-    if (receiverTokens.Any(t => !t.IsActive))
+    if (receiverDevices.Any(d => !d.IsActive))
     {
         await db.SaveChangesAsync();
     }
@@ -611,7 +593,6 @@ static string ConvertDatabaseUrlToConnectionString(string databaseUrl)
     var userInfo = uri.UserInfo.Split(':', 2);
     var username = Uri.UnescapeDataString(userInfo[0]);
     var password = userInfo.Length > 1 ? Uri.UnescapeDataString(userInfo[1]) : "";
-
     var database = uri.AbsolutePath.TrimStart('/');
 
     var connectionParts = new List<string>
@@ -640,7 +621,6 @@ static string BuildDisplayName(RegisteredUserEntity user)
     }
 
     var fullName = $"{user.FirstName} {user.LastName}".Trim();
-
     return string.IsNullOrWhiteSpace(fullName) ? "AlloChat" : fullName;
 }
 
@@ -698,8 +678,7 @@ static string PushBodyForMessage(string content, string senderName)
     return cleanContent;
 }
 
-
-static async Task<List<DeviceTokenEntity>> GetPushTokensForUserIDsAsync(
+static async Task<List<PushDeviceEntity>> GetPushDevicesForUserIDsAsync(
     AlloChatDbContext db,
     List<string> userIDs
 )
@@ -712,23 +691,37 @@ static async Task<List<DeviceTokenEntity>> GetPushTokensForUserIDsAsync(
 
     if (!cleanUserIDs.Any())
     {
-        return new List<DeviceTokenEntity>();
+        return new List<PushDeviceEntity>();
     }
 
-    return await db.DeviceTokens
-        .Where(t => cleanUserIDs.Contains(t.UserID) && t.IsActive)
-        .Where(t => !string.IsNullOrWhiteSpace(t.Token))
-        .GroupBy(t => t.Token)
-        .Select(group => group.First())
+    var deviceIDs = await db.PushDeviceProfiles
+        .Where(link => cleanUserIDs.Contains(link.UserID))
+        .Select(link => link.DeviceID)
+        .Distinct()
         .ToListAsync();
+
+    if (!deviceIDs.Any())
+    {
+        return new List<PushDeviceEntity>();
+    }
+
+    var devices = await db.PushDevices
+        .Where(device => deviceIDs.Contains(device.DeviceID) &&
+                         device.IsActive &&
+                         device.Token != "")
+        .ToListAsync();
+
+    return devices
+        .GroupBy(device => device.Token)
+        .Select(group => group.First())
+        .ToList();
 }
 
-static void EnsureDeviceTokensTable(AlloChatDbContext db)
+static void EnsureLegacyDeviceTokensTable(AlloChatDbContext db)
 {
     db.Database.ExecuteSqlRaw("""
         CREATE TABLE IF NOT EXISTS "DeviceTokens" (
             "DeviceTokenID" text NOT NULL,
-            "DeviceID" text NOT NULL DEFAULT '',
             "UserID" text NOT NULL,
             "Token" text NOT NULL,
             "Platform" text NOT NULL,
@@ -740,26 +733,7 @@ static void EnsureDeviceTokensTable(AlloChatDbContext db)
     """);
 
     db.Database.ExecuteSqlRaw("""
-        ALTER TABLE "DeviceTokens"
-        ADD COLUMN IF NOT EXISTS "DeviceID" text NOT NULL DEFAULT '';
-    """);
-
-    db.Database.ExecuteSqlRaw("""
         DROP INDEX IF EXISTS "IX_DeviceTokens_Token";
-    """);
-
-    db.Database.ExecuteSqlRaw("""
-        DROP INDEX IF EXISTS "IX_DeviceTokens_UserID_Token";
-    """);
-
-    db.Database.ExecuteSqlRaw("""
-        CREATE INDEX IF NOT EXISTS "IX_DeviceTokens_UserID"
-        ON "DeviceTokens" ("UserID");
-    """);
-
-    db.Database.ExecuteSqlRaw("""
-        CREATE INDEX IF NOT EXISTS "IX_DeviceTokens_DeviceID"
-        ON "DeviceTokens" ("DeviceID");
     """);
 
     db.Database.ExecuteSqlRaw("""
@@ -768,8 +742,58 @@ static void EnsureDeviceTokensTable(AlloChatDbContext db)
     """);
 
     db.Database.ExecuteSqlRaw("""
-        CREATE INDEX IF NOT EXISTS "IX_DeviceTokens_DeviceID_UserID"
-        ON "DeviceTokens" ("DeviceID", "UserID");
+        CREATE INDEX IF NOT EXISTS "IX_DeviceTokens_UserID"
+        ON "DeviceTokens" ("UserID");
+    """);
+
+    db.Database.ExecuteSqlRaw("""
+        CREATE UNIQUE INDEX IF NOT EXISTS "IX_DeviceTokens_UserID_Token"
+        ON "DeviceTokens" ("UserID", "Token");
+    """);
+}
+
+static void EnsurePushDeviceTables(AlloChatDbContext db)
+{
+    db.Database.ExecuteSqlRaw("""
+        CREATE TABLE IF NOT EXISTS "PushDevices" (
+            "DeviceID" text NOT NULL,
+            "Token" text NOT NULL,
+            "Platform" text NOT NULL,
+            "IsActive" boolean NOT NULL,
+            "CreatedAt" timestamp with time zone NOT NULL,
+            "LastSeenAt" timestamp with time zone NOT NULL,
+            CONSTRAINT "PK_PushDevices" PRIMARY KEY ("DeviceID")
+        );
+    """);
+
+    db.Database.ExecuteSqlRaw("""
+        CREATE TABLE IF NOT EXISTS "PushDeviceProfiles" (
+            "PushDeviceProfileID" text NOT NULL,
+            "DeviceID" text NOT NULL,
+            "UserID" text NOT NULL,
+            "CreatedAt" timestamp with time zone NOT NULL,
+            CONSTRAINT "PK_PushDeviceProfiles" PRIMARY KEY ("PushDeviceProfileID")
+        );
+    """);
+
+    db.Database.ExecuteSqlRaw("""
+        CREATE INDEX IF NOT EXISTS "IX_PushDevices_Token"
+        ON "PushDevices" ("Token");
+    """);
+
+    db.Database.ExecuteSqlRaw("""
+        CREATE INDEX IF NOT EXISTS "IX_PushDeviceProfiles_DeviceID"
+        ON "PushDeviceProfiles" ("DeviceID");
+    """);
+
+    db.Database.ExecuteSqlRaw("""
+        CREATE INDEX IF NOT EXISTS "IX_PushDeviceProfiles_UserID"
+        ON "PushDeviceProfiles" ("UserID");
+    """);
+
+    db.Database.ExecuteSqlRaw("""
+        CREATE UNIQUE INDEX IF NOT EXISTS "IX_PushDeviceProfiles_DeviceID_UserID"
+        ON "PushDeviceProfiles" ("DeviceID", "UserID");
     """);
 }
 
@@ -912,7 +936,6 @@ class ApnsPushService
         );
 
         var signature = Utils.Base64UrlEncode(signatureBytes);
-
         return $"{unsignedToken}.{signature}";
     }
 }
@@ -934,6 +957,8 @@ class AlloChatDbContext : DbContext
     public DbSet<RegisteredUserEntity> Users => Set<RegisteredUserEntity>();
     public DbSet<ChatMessageEntity> Messages => Set<ChatMessageEntity>();
     public DbSet<DeviceTokenEntity> DeviceTokens => Set<DeviceTokenEntity>();
+    public DbSet<PushDeviceEntity> PushDevices => Set<PushDeviceEntity>();
+    public DbSet<PushDeviceProfileEntity> PushDeviceProfiles => Set<PushDeviceProfileEntity>();
 
     protected override void OnModelCreating(ModelBuilder modelBuilder)
     {
@@ -966,10 +991,27 @@ class AlloChatDbContext : DbContext
             .HasIndex(t => t.UserID);
 
         modelBuilder.Entity<DeviceTokenEntity>()
-            .HasIndex(t => t.DeviceID);
+            .HasIndex(t => new { t.UserID, t.Token })
+            .IsUnique();
 
-        modelBuilder.Entity<DeviceTokenEntity>()
-            .HasIndex(t => new { t.DeviceID, t.UserID });
+        modelBuilder.Entity<PushDeviceEntity>()
+            .HasKey(d => d.DeviceID);
+
+        modelBuilder.Entity<PushDeviceEntity>()
+            .HasIndex(d => d.Token);
+
+        modelBuilder.Entity<PushDeviceProfileEntity>()
+            .HasKey(dp => dp.PushDeviceProfileID);
+
+        modelBuilder.Entity<PushDeviceProfileEntity>()
+            .HasIndex(dp => dp.DeviceID);
+
+        modelBuilder.Entity<PushDeviceProfileEntity>()
+            .HasIndex(dp => dp.UserID);
+
+        modelBuilder.Entity<PushDeviceProfileEntity>()
+            .HasIndex(dp => new { dp.DeviceID, dp.UserID })
+            .IsUnique();
     }
 }
 
@@ -1002,7 +1044,6 @@ class ChatMessageEntity
 class DeviceTokenEntity
 {
     public string DeviceTokenID { get; set; } = "";
-    public string DeviceID { get; set; } = "";
     public string UserID { get; set; } = "";
     public string Token { get; set; } = "";
     public string Platform { get; set; } = "watchOS";
@@ -1011,13 +1052,30 @@ class DeviceTokenEntity
     public DateTime LastSeenAt { get; set; }
 }
 
+class PushDeviceEntity
+{
+    public string DeviceID { get; set; } = "";
+    public string Token { get; set; } = "";
+    public string Platform { get; set; } = "watchOS";
+    public bool IsActive { get; set; } = true;
+    public DateTime CreatedAt { get; set; }
+    public DateTime LastSeenAt { get; set; }
+}
+
+class PushDeviceProfileEntity
+{
+    public string PushDeviceProfileID { get; set; } = "";
+    public string DeviceID { get; set; } = "";
+    public string UserID { get; set; } = "";
+    public DateTime CreatedAt { get; set; }
+}
+
 // -------- Models --------
 
 record WeatherForecast(DateOnly Date, int TemperatureC, string? Summary)
 {
     public int TemperatureF => 32 + (int)(TemperatureC / 0.5556);
 }
-
 
 record RegisterUserRequest(
     string FirstName,
@@ -1076,7 +1134,6 @@ record SendMessageResponse(
     bool Success,
     string Message
 );
-
 
 record EmergencyAlertRequest(
     string SenderID,
