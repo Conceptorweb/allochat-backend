@@ -320,9 +320,10 @@ app.MapPost("/api/messages/send", async (
     db.Messages.Add(message);
     await db.SaveChangesAsync();
 
-    var receiverTokens = await db.DeviceTokens
-        .Where(t => t.UserID == request.ReceiverID && t.IsActive)
-        .ToListAsync();
+    var receiverTokens = await GetPushTokensForUserIDsAsync(
+        db,
+        new List<string> { request.ReceiverID }
+    );
 
     var senderName = string.IsNullOrWhiteSpace(request.SenderDisplayName)
         ? BuildDisplayName(sender)
@@ -434,9 +435,10 @@ app.MapPost("/api/emergency/send", async (
 
     var receiverUserIDs = receivers.Select(r => r.UserID).ToList();
 
-    var receiverTokens = await db.DeviceTokens
-        .Where(t => receiverUserIDs.Contains(t.UserID) && t.IsActive)
-        .ToListAsync();
+    var receiverTokens = await GetPushTokensForUserIDsAsync(
+        db,
+        receiverUserIDs
+    );
 
     var pushTitle = $"🚨 Emergency from {senderName}";
     var pushBody = request.Latitude.HasValue && request.Longitude.HasValue
@@ -666,6 +668,51 @@ static string PushBodyForMessage(string content, string senderName)
     return cleanContent;
 }
 
+
+static async Task<List<DeviceTokenEntity>> GetPushTokensForUserIDsAsync(
+    AlloChatDbContext db,
+    List<string> userIDs
+)
+{
+    var cleanUserIDs = userIDs
+        .Where(id => !string.IsNullOrWhiteSpace(id))
+        .Select(id => id.Trim())
+        .Distinct()
+        .ToList();
+
+    if (!cleanUserIDs.Any())
+    {
+        return new List<DeviceTokenEntity>();
+    }
+
+    // First get the active APNs tokens directly linked to the target user(s).
+    var directTokens = await db.DeviceTokens
+        .Where(t => cleanUserIDs.Contains(t.UserID) && t.IsActive)
+        .ToListAsync();
+
+    var tokenValues = directTokens
+        .Select(t => t.Token)
+        .Where(token => !string.IsNullOrWhiteSpace(token))
+        .Distinct()
+        .ToList();
+
+    if (!tokenValues.Any())
+    {
+        return new List<DeviceTokenEntity>();
+    }
+
+    // Multi-profile Apple Watch support:
+    // the same physical watch APNs token can be registered for P1, P2, P3.
+    // We fetch all active rows sharing these token values, then send once per token.
+    var sharedTokenRows = await db.DeviceTokens
+        .Where(t => tokenValues.Contains(t.Token) && t.IsActive)
+        .ToListAsync();
+
+    return sharedTokenRows
+        .GroupBy(t => t.Token)
+        .Select(group => group.First())
+        .ToList();
+}
 
 static void EnsureDeviceTokensTable(AlloChatDbContext db)
 {
