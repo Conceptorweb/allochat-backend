@@ -27,6 +27,9 @@ builder.Services.AddHttpClient<ApnsPushService>();
 
 var app = builder.Build();
 
+
+
+
 app.UseSwagger();
 app.UseSwaggerUI();
 
@@ -38,6 +41,39 @@ using (var scope = app.Services.CreateScope())
     EnsureMessageDeletionColumns(db);
     EnsureDeviceArchitectureTables(db);
 }
+
+
+_ = Task.Run(async () =>
+{
+    while (true)
+    {
+        try
+        {
+            using var scope = app.Services.CreateScope();
+            var db = scope.ServiceProvider.GetRequiredService<AlloChatDbContext>();
+
+            var threshold = DateTime.UtcNow.AddDays(-7);
+
+            var oldMessages = await db.Messages
+                .Where(m => m.SentAt < threshold)
+                .ToListAsync();
+
+            if (oldMessages.Any())
+            {
+                db.Messages.RemoveRange(oldMessages);
+                await db.SaveChangesAsync();
+                Console.WriteLine($"Cleaned {oldMessages.Count} old messages");
+            }
+        }
+        catch (Exception ex)
+        {
+            Console.WriteLine($"Cleanup error: {ex.Message}");
+        }
+
+        await Task.Delay(TimeSpan.FromHours(6));
+    }
+});
+
 
 var summaries = new[]
 {
@@ -543,12 +579,9 @@ app.MapPost("/api/messages/acknowledge", async (AcknowledgeMessageRequest reques
         .Where(m => request.MessageIDs.Contains(m.MessageID) && !m.Delivered)
         .ToListAsync();
 
-    foreach (var message in messagesToUpdate)
-    {
-        message.Delivered = true;
-    }
+    db.Messages.RemoveRange(messagesToUpdate);
 
-    await db.SaveChangesAsync();
+await db.SaveChangesAsync();
 
     return Results.Ok(new StandardServerResponse(true, $"{messagesToUpdate.Count} messages acknowledged."));
 })
