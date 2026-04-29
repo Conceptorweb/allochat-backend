@@ -40,6 +40,65 @@ using (var scope = app.Services.CreateScope())
     EnsureUserSessionColumns(db);
     EnsureMessageDeletionColumns(db);
     EnsureDeviceArchitectureTables(db);
+
+
+static void EnsureGroupTables(AlloChatDbContext db)
+{
+    db.Database.ExecuteSqlRaw("""
+        CREATE TABLE IF NOT EXISTS "Groups" (
+            "GroupID" text NOT NULL,
+            "Name" text NOT NULL,
+            "CreatedAt" timestamp with time zone NOT NULL,
+            CONSTRAINT "PK_Groups" PRIMARY KEY ("GroupID")
+        );
+    """);
+
+    db.Database.ExecuteSqlRaw("""
+        CREATE TABLE IF NOT EXISTS "GroupMembers" (
+            "GroupMemberID" text NOT NULL,
+            "GroupID" text NOT NULL,
+            "UserID" text NOT NULL,
+            "DisplayName" text NOT NULL,
+            "AvatarImageData" text NULL,
+            CONSTRAINT "PK_GroupMembers" PRIMARY KEY ("GroupMemberID")
+        );
+    """);
+
+    db.Database.ExecuteSqlRaw("""
+        CREATE TABLE IF NOT EXISTS "GroupMessages" (
+            "MessageID" text NOT NULL,
+            "GroupID" text NOT NULL,
+            "SenderID" text NOT NULL,
+            "SenderName" text NOT NULL,
+            "Content" text NOT NULL,
+            "SentAt" timestamp with time zone NOT NULL,
+            CONSTRAINT "PK_GroupMessages" PRIMARY KEY ("MessageID")
+        );
+    """);
+
+    db.Database.ExecuteSqlRaw("""
+        CREATE INDEX IF NOT EXISTS "IX_GroupMembers_GroupID"
+        ON "GroupMembers" ("GroupID");
+    """);
+
+    db.Database.ExecuteSqlRaw("""
+        CREATE INDEX IF NOT EXISTS "IX_GroupMembers_UserID"
+        ON "GroupMembers" ("UserID");
+    """);
+
+    db.Database.ExecuteSqlRaw("""
+        CREATE INDEX IF NOT EXISTS "IX_GroupMessages_GroupID"
+        ON "GroupMessages" ("GroupID");
+    """);
+
+    db.Database.ExecuteSqlRaw("""
+        CREATE INDEX IF NOT EXISTS "IX_GroupMessages_SenderID"
+        ON "GroupMessages" ("SenderID");
+    """);
+}
+
+
+    EnsureGroupTables(db);
 }
 
 
