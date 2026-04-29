@@ -688,6 +688,11 @@ static string PushBodyForMessage(string content, string senderName)
         return $"{senderName} shared a location.";
     }
 
+if (cleanContent.StartsWith("[IMAGE_V1]"))
+{
+    return $"{senderName} sent you a photo.";
+}
+
     if (cleanContent.Length > 120)
     {
         return cleanContent.Substring(0, 117) + "...";
