@@ -35,6 +35,7 @@ using (var scope = app.Services.CreateScope())
     var db = scope.ServiceProvider.GetRequiredService<AlloChatDbContext>();
     db.Database.EnsureCreated();
     EnsureUserSessionColumns(db);
+    EnsureMessageDeletionColumns(db);
     EnsureDeviceArchitectureTables(db);
 }
 
@@ -329,9 +330,61 @@ app.MapPost("/api/messages/send", async (
         await db.SaveChangesAsync();
     }
 
-    return Results.Ok(new SendMessageResponse(true, "Message sent."));
+    return Results.Ok(new SendMessageResponse(true, "Message sent.", message.MessageID));
 })
 .WithName("SendMessage")
+.WithOpenApi();
+
+
+app.MapPost("/api/messages/delete", async (DeleteMessageRequest request, AlloChatDbContext db) =>
+{
+    var cleanMessageID = request.MessageID?.Trim() ?? "";
+    var cleanRequesterID = request.RequesterID?.Trim() ?? "";
+
+    if (string.IsNullOrWhiteSpace(cleanMessageID) || string.IsNullOrWhiteSpace(cleanRequesterID))
+    {
+        return Results.BadRequest(new StandardServerResponse(false, "MessageID and RequesterID are required."));
+    }
+
+    var message = await db.Messages.FirstOrDefaultAsync(m => m.MessageID == cleanMessageID);
+
+    if (message == null)
+    {
+        return Results.NotFound(new StandardServerResponse(false, "Message not found."));
+    }
+
+    if (message.SenderID == cleanRequesterID)
+    {
+        if (!message.DeletedForEveryone)
+        {
+            message.DeletedForEveryone = true;
+            message.Content = "This message was deleted";
+
+            db.Messages.Add(new ChatMessageEntity
+            {
+                MessageID = Guid.NewGuid().ToString(),
+                SenderID = message.SenderID,
+                ReceiverID = message.ReceiverID,
+                Content = $"[DELETE_EVERYONE]|{message.MessageID}",
+                SentAt = DateTime.UtcNow,
+                Delivered = false,
+                DeletedForEveryone = false
+            });
+
+            await db.SaveChangesAsync();
+        }
+
+        return Results.Ok(new StandardServerResponse(true, "Message deleted for everyone."));
+    }
+
+    if (message.ReceiverID == cleanRequesterID)
+    {
+        return Results.Ok(new StandardServerResponse(true, "Message deleted locally."));
+    }
+
+    return Results.BadRequest(new StandardServerResponse(false, "You cannot delete this message."));
+})
+.WithName("DeleteMessage")
 .WithOpenApi();
 
 app.MapPost("/api/emergency/send", async (
@@ -458,14 +511,20 @@ app.MapGet("/api/messages/pending/{userID}", async (string userID, AlloChatDbCon
         .ToDictionaryAsync(u => u.UserID);
 
     var pending = pendingEntities
-        .Select(m => new PendingMessageItem(
-            m.MessageID,
-            m.SenderID,
-            m.ReceiverID,
-            m.Content,
-            m.SentAt,
-            senders.TryGetValue(m.SenderID, out var sender) ? BuildDisplayName(sender) : "AlloChat"
-        ))
+        .Select(m =>
+        {
+            senders.TryGetValue(m.SenderID, out var sender);
+
+            return new PendingMessageItem(
+                m.MessageID,
+                m.SenderID,
+                m.ReceiverID,
+                m.DeletedForEveryone ? "This message was deleted" : m.Content,
+                m.SentAt,
+                sender != null ? BuildDisplayName(sender) : "AlloChat",
+                sender?.AvatarImageData
+            );
+        })
         .ToList();
 
     return Results.Ok(new PendingMessagesResponse(pending));
@@ -700,6 +759,15 @@ static void EnsureUserSessionColumns(AlloChatDbContext db)
     """);
 }
 
+
+static void EnsureMessageDeletionColumns(AlloChatDbContext db)
+{
+    db.Database.ExecuteSqlRaw("""
+        ALTER TABLE "Messages"
+        ADD COLUMN IF NOT EXISTS "DeletedForEveryone" boolean NOT NULL DEFAULT false;
+    """);
+}
+
 // -------- APNs --------
 
 class ApnsPushService
@@ -861,6 +929,7 @@ class ChatMessageEntity
     public string Content { get; set; } = "";
     public DateTime SentAt { get; set; }
     public bool Delivered { get; set; }
+    public bool DeletedForEveryone { get; set; }
 }
 
 class DeviceEntity
@@ -894,10 +963,11 @@ record RestoreAccountRequest(string UserID, string AlloCode, string DeviceID);
 record RestoreAccountResponse(bool Success, string Message, string UserID, string AlloCode, string FirstName, string LastName, string Nickname, string AvatarSystemName, string Availability, string? AvatarImageData, string ActiveDeviceID, int SessionVersion);
 record StandardServerResponse(bool Success, string Message);
 record SendMessageRequest(string SenderID, string ReceiverID, string Content, string? SenderDisplayName);
-record SendMessageResponse(bool Success, string Message);
+record SendMessageResponse(bool Success, string Message, string? MessageID);
+record DeleteMessageRequest(string MessageID, string RequesterID);
 record EmergencyAlertRequest(string SenderID, List<string> ReceiverIDs, string SenderName, double? Latitude, double? Longitude, string Content);
 record EmergencyAlertResponse(bool Success, string Message, int SentCount, int FailedCount);
-record PendingMessageItem(string MessageID, string SenderID, string ReceiverID, string Content, DateTime SentAt, string? SenderDisplayName);
+record PendingMessageItem(string MessageID, string SenderID, string ReceiverID, string Content, DateTime SentAt, string? SenderDisplayName, string? SenderAvatarImageData);
 record PendingMessagesResponse(List<PendingMessageItem> Messages);
 record AcknowledgeMessageRequest(List<string> MessageIDs);
 record ContactLookupRequest(string AlloCode);
