@@ -952,6 +952,19 @@ class AlloChatDbContext : DbContext
         modelBuilder.Entity<DeviceProfileEntity>().HasIndex(dp => dp.DeviceID);
         modelBuilder.Entity<DeviceProfileEntity>().HasIndex(dp => dp.UserID);
         modelBuilder.Entity<DeviceProfileEntity>().HasIndex(dp => new { dp.DeviceID, dp.UserID }).IsUnique();
+
+
+modelBuilder.Entity<GroupEntity>().HasKey(g => g.GroupID);
+modelBuilder.Entity<GroupEntity>().HasIndex(g => g.Name);
+
+modelBuilder.Entity<GroupMemberEntity>().HasKey(gm => gm.GroupMemberID);
+modelBuilder.Entity<GroupMemberEntity>().HasIndex(gm => gm.GroupID);
+modelBuilder.Entity<GroupMemberEntity>().HasIndex(gm => gm.UserID);
+
+modelBuilder.Entity<GroupMessageEntity>().HasKey(gm => gm.MessageID);
+modelBuilder.Entity<GroupMessageEntity>().HasIndex(gm => gm.GroupID);
+modelBuilder.Entity<GroupMessageEntity>().HasIndex(gm => gm.SenderID);
+
     }
 }
 
