@@ -591,6 +591,12 @@ return Results.Ok(new StandardServerResponse(true, "ACK processed."));
 .WithOpenApi();
 
 var port = Environment.GetEnvironmentVariable("PORT") ?? "10000";
+
+
+
+app.MapGroupEndpoints();
+
+
 app.Run($"http://0.0.0.0:{port}");
 
 // -------- Helpers --------
@@ -924,6 +930,10 @@ class AlloChatDbContext : DbContext
     public DbSet<ChatMessageEntity> Messages => Set<ChatMessageEntity>();
     public DbSet<DeviceEntity> Devices => Set<DeviceEntity>();
     public DbSet<DeviceProfileEntity> DeviceProfiles => Set<DeviceProfileEntity>();
+
+    public DbSet<GroupEntity> Groups => Set<GroupEntity>();
+    public DbSet<GroupMemberEntity> GroupMembers => Set<GroupMemberEntity>();
+    public DbSet<GroupMessageEntity> GroupMessages => Set<GroupMessageEntity>();
 
     protected override void OnModelCreating(ModelBuilder modelBuilder)
     {
