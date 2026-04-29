@@ -536,7 +536,7 @@ app.MapGet("/api/messages/pending/{userID}", async (string userID, AlloChatDbCon
     }
 
     var pendingEntities = await db.Messages
-        .Where(m => m.ReceiverID == userID && !m.Delivered)
+        .Where(m => m.ReceiverID == userID)
         .OrderBy(m => m.SentAt)
         .ToListAsync();
 
@@ -576,14 +576,16 @@ app.MapPost("/api/messages/acknowledge", async (AcknowledgeMessageRequest reques
     }
 
     var messagesToUpdate = await db.Messages
-        .Where(m => request.MessageIDs.Contains(m.MessageID) && !m.Delivered)
-        .ToListAsync();
+    .Where(m => request.MessageIDs.Contains(m.MessageID))
+    .ToListAsync();
 
+if (messagesToUpdate.Any())
+{
     db.Messages.RemoveRange(messagesToUpdate);
+    await db.SaveChangesAsync();
+}
 
-await db.SaveChangesAsync();
-
-    return Results.Ok(new StandardServerResponse(true, $"{messagesToUpdate.Count} messages acknowledged."));
+return Results.Ok(new StandardServerResponse(true, "ACK processed."));
 })
 .WithName("AcknowledgeMessages")
 .WithOpenApi();
