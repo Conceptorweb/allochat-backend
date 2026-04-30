@@ -908,6 +908,15 @@ class ApnsPushService
                 ? "https://api.sandbox.push.apple.com"
                 : "https://api.push.apple.com";
 
+
+Console.WriteLine($"APNS CONFIG env={apnsEnv}");
+Console.WriteLine($"APNS CONFIG host={host}");
+Console.WriteLine($"APNS CONFIG keyID={keyID}");
+Console.WriteLine($"APNS CONFIG teamID={teamID}");
+Console.WriteLine($"APNS CONFIG bundleID={bundleID}");
+Console.WriteLine($"APNS CONFIG tokenLength={deviceToken.Length}");
+
+
             var url = $"{host}/3/device/{deviceToken}";
 
             var payload = new
