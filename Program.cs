@@ -46,19 +46,19 @@ static void EnsureGroupTables(AlloChatDbContext db)
 {
     db.Database.ExecuteSqlRaw("""
         CREATE TABLE IF NOT EXISTS "Groups" (
-    "GroupID" text NOT NULL,
-    "Name" text NOT NULL,
-    "CreatorUserID" text NOT NULL DEFAULT '',
-    "CreatedAt" timestamp with time zone NOT NULL,
-    CONSTRAINT "PK_Groups" PRIMARY KEY ("GroupID")
-);
+            "GroupID" text NOT NULL,
+            "Name" text NOT NULL,
+            "CreatorUserID" text NOT NULL DEFAULT '',
+            "CreatedAt" timestamp with time zone NOT NULL,
+            CONSTRAINT "PK_Groups" PRIMARY KEY ("GroupID")
+        );
     """);
 
 
-db.Database.ExecuteSqlRaw("""
+    db.Database.ExecuteSqlRaw("""
     ALTER TABLE "Groups"
     ADD COLUMN IF NOT EXISTS "CreatorUserID" text NOT NULL DEFAULT '';
-""");
+    """);
 
     db.Database.ExecuteSqlRaw("""
         CREATE TABLE IF NOT EXISTS "GroupMembers" (
