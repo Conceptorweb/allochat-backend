@@ -86,15 +86,27 @@ if (string.IsNullOrWhiteSpace(cleanCreatorUserID))
         return Results.BadRequest(new StandardServerResponse(false, "Invalid group message data."));
     }
 
-    var isMember = await db.GroupMembers.AnyAsync(gm =>
-        gm.GroupID == cleanGroupID &&
-        gm.UserID == cleanSenderID
-    );
+    var group = await db.Groups.FirstOrDefaultAsync(g => g.GroupID == cleanGroupID);
 
-    if (!isMember)
-    {
-        return Results.BadRequest(new StandardServerResponse(false, "Sender is not a member of this group."));
-    }
+if (group == null)
+{
+    return Results.NotFound(new StandardServerResponse(false, "Group not found."));
+}
+
+if (group.IsDeleted)
+{
+    return Results.BadRequest(new StandardServerResponse(false, "This group has been deleted. It can now be viewed only."));
+}
+
+var isMember = await db.GroupMembers.AnyAsync(gm =>
+    gm.GroupID == cleanGroupID &&
+    gm.UserID == cleanSenderID
+);
+
+if (!isMember)
+{
+    return Results.BadRequest(new StandardServerResponse(false, "Sender is not a member of this group."));
+}
 
     var message = new GroupMessageEntity
     {
@@ -220,6 +232,7 @@ return Results.Ok(new StandardServerResponse(
     g.GroupID,
     g.Name,
     g.CreatorUserID,
+    g.IsDeleted,
     g.CreatedAt
 ))
         .ToListAsync();
@@ -307,23 +320,33 @@ app.MapPost("/api/groups/delete", async (DeleteGroupRequest request, AlloChatDbC
         return Results.BadRequest(new StandardServerResponse(false, "Only the group creator can delete this group."));
     }
 
+    if (group.IsDeleted)
+    {
+        return Results.Ok(new StandardServerResponse(true, "Group already deleted."));
+    }
+
+    var creatorMember = await db.GroupMembers.FirstOrDefaultAsync(gm =>
+        gm.GroupID == cleanGroupID &&
+        gm.UserID == cleanRequestingUserID
+    );
+
+    var creatorName = string.IsNullOrWhiteSpace(creatorMember?.DisplayName)
+        ? "the creator"
+        : creatorMember.DisplayName.Trim();
+
+    group.IsDeleted = true;
+
     var deletedMessage = new GroupMessageEntity
     {
         MessageID = Guid.NewGuid().ToString(),
         GroupID = cleanGroupID,
         SenderID = cleanRequestingUserID,
         SenderName = "System",
-        Content = "[GROUP_DELETED]\nGroup deleted by creator.",
+        Content = $"[GROUP_DELETED]\nThis group was deleted by {creatorName}. It can now be viewed only.",
         SentAt = DateTime.UtcNow
     };
 
     db.GroupMessages.Add(deletedMessage);
-
-    var memberships = await db.GroupMembers
-        .Where(gm => gm.GroupID == cleanGroupID)
-        .ToListAsync();
-
-    db.GroupMembers.RemoveRange(memberships);
 
     await db.SaveChangesAsync();
 
@@ -376,7 +399,7 @@ public record CreateGroupResponse(string GroupID);
 public record GroupMemberDTO(string UserID, string DisplayName, string? AvatarImageData);
 public record SendGroupMessageRequest(string GroupID, string SenderID, string SenderName, string Content);
 public record GroupMessageResponse(string MessageID, string GroupID, string SenderID, string SenderName, string Content, DateTime SentAt);
-public record UserGroupResponse(string GroupID, string Name, string CreatorUserID, DateTime CreatedAt);
+public record UserGroupResponse(string GroupID, string Name, string CreatorUserID, bool IsDeleted, DateTime CreatedAt);
 public record LeaveGroupRequest(string GroupID, string UserID);
 public record DeleteGroupRequest(string GroupID, string RequestingUserID);
 
