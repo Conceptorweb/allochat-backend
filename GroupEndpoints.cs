@@ -58,47 +58,81 @@ public static class GroupEndpoints
         .WithName("CreateGroup")
         .WithOpenApi();
 
-        app.MapPost("/api/groups/send", async (SendGroupMessageRequest request, AlloChatDbContext db) =>
+
+
+
+        app.MapPost("/api/groups/send", async (
+    SendGroupMessageRequest request,
+    AlloChatDbContext db,
+    ApnsPushService pushService
+) =>
+{
+    var cleanGroupID = request.GroupID?.Trim().ToLowerInvariant() ?? "";
+    var cleanSenderID = request.SenderID?.Trim() ?? "";
+    var cleanSenderName = request.SenderName?.Trim() ?? "";
+    var cleanContent = request.Content?.Trim() ?? "";
+
+    if (string.IsNullOrWhiteSpace(cleanGroupID) ||
+        string.IsNullOrWhiteSpace(cleanSenderID) ||
+        string.IsNullOrWhiteSpace(cleanContent))
+    {
+        return Results.BadRequest(new StandardServerResponse(false, "Invalid group message data."));
+    }
+
+    var isMember = await db.GroupMembers.AnyAsync(gm =>
+        gm.GroupID == cleanGroupID &&
+        gm.UserID == cleanSenderID
+    );
+
+    if (!isMember)
+    {
+        return Results.BadRequest(new StandardServerResponse(false, "Sender is not a member of this group."));
+    }
+
+    var message = new GroupMessageEntity
+    {
+        MessageID = Guid.NewGuid().ToString(),
+        GroupID = cleanGroupID,
+        SenderID = cleanSenderID,
+        SenderName = string.IsNullOrWhiteSpace(cleanSenderName) ? "Member" : cleanSenderName,
+        Content = cleanContent,
+        SentAt = DateTime.UtcNow
+    };
+
+    db.GroupMessages.Add(message);
+    await db.SaveChangesAsync();
+
+    var receiverUserIDs = await db.GroupMembers
+        .Where(gm => gm.GroupID == cleanGroupID && gm.UserID != cleanSenderID)
+        .Select(gm => gm.UserID)
+        .Distinct()
+        .ToListAsync();
+
+    var receiverDevices = await GetActiveDevicesForGroupUserIDsAsync(db, receiverUserIDs);
+
+    foreach (var device in receiverDevices)
+    {
+        var pushResult = await pushService.SendMessageNotificationAsync(
+            deviceToken: device.Token,
+            title: $"Group message from {message.SenderName}",
+            body: cleanContent.Length > 120 ? cleanContent.Substring(0, 117) + "..." : cleanContent
+        );
+
+        if (!pushResult.Success && (pushResult.StatusCode == 400 || pushResult.StatusCode == 410))
         {
-            var cleanGroupID = request.GroupID?.Trim() ?? "";
-            var cleanSenderID = request.SenderID?.Trim() ?? "";
-            var cleanSenderName = request.SenderName?.Trim() ?? "";
-            var cleanContent = request.Content?.Trim() ?? "";
+            device.IsActive = false;
+        }
+    }
 
-            if (string.IsNullOrWhiteSpace(cleanGroupID) ||
-                string.IsNullOrWhiteSpace(cleanSenderID) ||
-                string.IsNullOrWhiteSpace(cleanContent))
-            {
-                return Results.BadRequest(new StandardServerResponse(false, "Invalid group message data."));
-            }
+    if (receiverDevices.Any(d => !d.IsActive))
+    {
+        await db.SaveChangesAsync();
+    }
 
-            var isMember = await db.GroupMembers.AnyAsync(gm =>
-                gm.GroupID == cleanGroupID &&
-                gm.UserID == cleanSenderID
-            );
-
-            if (!isMember)
-            {
-                return Results.BadRequest(new StandardServerResponse(false, "Sender is not a member of this group."));
-            }
-
-            var message = new GroupMessageEntity
-            {
-                MessageID = Guid.NewGuid().ToString(),
-                GroupID = cleanGroupID,
-                SenderID = cleanSenderID,
-                SenderName = string.IsNullOrWhiteSpace(cleanSenderName) ? "Member" : cleanSenderName,
-                Content = cleanContent,
-                SentAt = DateTime.UtcNow
-            };
-
-            db.GroupMessages.Add(message);
-            await db.SaveChangesAsync();
-
-            return Results.Ok(new StandardServerResponse(true, "Message sent."));
-        })
-        .WithName("SendGroupMessage")
-        .WithOpenApi();
+    return Results.Ok(new StandardServerResponse(true, "Message sent."));
+})
+.WithName("SendGroupMessage")
+.WithOpenApi();
 
         app.MapGet("/api/groups/messages/{groupID}", async (string groupID, AlloChatDbContext db) =>
         {
@@ -206,15 +240,54 @@ public static class GroupEndpoints
 
             return Results.Ok(new StandardServerResponse(true, "Left group."));
         })
+        
+
         .WithName("LeaveGroup")
         .WithOpenApi();
+    }
+
+    private static async Task<List<DeviceEntity>> GetActiveDevicesForGroupUserIDsAsync(
+        AlloChatDbContext db,
+        List<string> userIDs
+    )
+    {
+        var cleanUserIDs = userIDs
+            .Where(id => !string.IsNullOrWhiteSpace(id))
+            .Select(id => id.Trim())
+            .Distinct()
+            .ToList();
+
+        if (!cleanUserIDs.Any())
+        {
+            return new List<DeviceEntity>();
+        }
+
+        var deviceIDs = await db.DeviceProfiles
+            .Where(link => cleanUserIDs.Contains(link.UserID))
+            .Select(link => link.DeviceID)
+            .Distinct()
+            .ToListAsync();
+
+        if (!deviceIDs.Any())
+        {
+            return new List<DeviceEntity>();
+        }
+
+        return await db.Devices
+            .Where(device => deviceIDs.Contains(device.DeviceID) && device.IsActive && device.Token != "")
+            .GroupBy(device => device.DeviceID)
+            .Select(group => group.First())
+            .ToListAsync();
     }
 }
 
 public record CreateGroupRequest(string Name, List<GroupMemberDTO> Members);
+
+
 public record CreateGroupResponse(string GroupID);
 public record GroupMemberDTO(string UserID, string DisplayName, string? AvatarImageData);
 public record SendGroupMessageRequest(string GroupID, string SenderID, string SenderName, string Content);
 public record GroupMessageResponse(string MessageID, string GroupID, string SenderID, string SenderName, string Content, DateTime SentAt);
 public record UserGroupResponse(string GroupID, string Name, DateTime CreatedAt);
 public record LeaveGroupRequest(string GroupID, string UserID);
+
