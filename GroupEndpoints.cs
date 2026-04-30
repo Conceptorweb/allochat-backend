@@ -141,7 +141,11 @@ foreach (var device in receiverDevices)
         await db.SaveChangesAsync();
     }
 
-    return Results.Ok(new StandardServerResponse(true, "Message sent."));
+    return Results.Ok(new StandardServerResponse(
+    true,
+    $"Message sent. GROUP_PUSH_V2 receivers={receiverUserIDs.Count} devices={receiverDevices.Count}"
+));
+
 })
 .WithName("SendGroupMessage")
 .WithOpenApi();
