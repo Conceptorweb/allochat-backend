@@ -136,7 +136,7 @@ public static class GroupEndpoints
 
         app.MapGet("/api/groups/messages/{groupID}", async (string groupID, AlloChatDbContext db) =>
         {
-            var cleanGroupID = groupID?.Trim() ?? "";
+            var cleanGroupID = groupID?.Trim().ToLowerInvariant() ?? "";
 
             if (string.IsNullOrWhiteSpace(cleanGroupID))
             {
@@ -193,7 +193,7 @@ public static class GroupEndpoints
 
         app.MapGet("/api/groups/{groupID}/members", async (string groupID, AlloChatDbContext db) =>
         {
-            var cleanGroupID = groupID?.Trim() ?? "";
+            var cleanGroupID = groupID?.Trim().ToLowerInvariant() ?? "";
 
             if (string.IsNullOrWhiteSpace(cleanGroupID))
             {
@@ -217,7 +217,7 @@ public static class GroupEndpoints
 
         app.MapPost("/api/groups/leave", async (LeaveGroupRequest request, AlloChatDbContext db) =>
         {
-            var cleanGroupID = request.GroupID?.Trim() ?? "";
+            var cleanGroupID = request.GroupID?.Trim().ToLowerInvariant() ?? "";
             var cleanUserID = request.UserID?.Trim() ?? "";
 
             if (string.IsNullOrWhiteSpace(cleanGroupID) ||
