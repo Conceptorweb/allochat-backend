@@ -161,35 +161,45 @@ public static class GroupEndpoints
         .WithName("GetGroupMessages")
         .WithOpenApi();
 
+
+
+
+
+
         app.MapGet("/api/groups/user/{userID}", async (string userID, AlloChatDbContext db) =>
-        {
-            var cleanUserID = userID?.Trim() ?? "";
+{
+    var cleanUserID = userID?.Trim() ?? "";
 
-            if (string.IsNullOrWhiteSpace(cleanUserID))
-            {
-                return Results.BadRequest(new StandardServerResponse(false, "UserID is required."));
-            }
+    if (string.IsNullOrWhiteSpace(cleanUserID))
+    {
+        return Results.BadRequest(new StandardServerResponse(false, "UserID is required."));
+    }
 
-            var groups = await db.GroupMembers
-                .Where(gm => gm.UserID == cleanUserID)
-                .Join(
-                    db.Groups,
-                    gm => gm.GroupID,
-                    g => g.GroupID,
-                    (gm, g) => new UserGroupResponse(
-                        g.GroupID,
-                        g.Name,
-                        g.CreatedAt
-                    )
-                )
-                .Distinct()
-                .OrderByDescending(g => g.CreatedAt)
-                .ToListAsync();
+    var groupIDs = await db.GroupMembers
+        .Where(gm => gm.UserID == cleanUserID)
+        .Select(gm => gm.GroupID)
+        .Distinct()
+        .ToListAsync();
 
-            return Results.Ok(groups);
-        })
-        .WithName("GetGroupsForUser")
-        .WithOpenApi();
+    if (!groupIDs.Any())
+    {
+        return Results.Ok(new List<UserGroupResponse>());
+    }
+
+    var groups = await db.Groups
+        .Where(g => groupIDs.Contains(g.GroupID))
+        .OrderByDescending(g => g.CreatedAt)
+        .Select(g => new UserGroupResponse(
+            g.GroupID,
+            g.Name,
+            g.CreatedAt
+        ))
+        .ToListAsync();
+
+    return Results.Ok(groups);
+})
+.WithName("GetGroupsForUser")
+.WithOpenApi();
 
         app.MapGet("/api/groups/{groupID}/members", async (string groupID, AlloChatDbContext db) =>
         {
