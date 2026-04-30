@@ -550,13 +550,20 @@ app.MapPost("/api/emergency/send", async (
     var pushSuccessCount = 0;
     var pushFailureCount = 0;
 
-    foreach (var device in receiverDevices)
-    {
-        var pushResult = await pushService.SendMessageNotificationAsync(
-            deviceToken: device.Token,
-            title: pushTitle,
-            body: pushBody
-        );
+    Console.WriteLine($"EMERGENCY PUSH DEBUG receivers={receiverUserIDs.Count}");
+Console.WriteLine($"EMERGENCY PUSH DEBUG devices={receiverDevices.Count}");
+
+foreach (var device in receiverDevices)
+{
+    Console.WriteLine($"EMERGENCY PUSH DEBUG sending to deviceID={device.DeviceID} tokenLength={device.Token.Length}");
+
+    var pushResult = await pushService.SendMessageNotificationAsync(
+        deviceToken: device.Token,
+        title: pushTitle,
+        body: pushBody
+    );
+
+    Console.WriteLine($"EMERGENCY APNS RESULT success={pushResult.Success} status={pushResult.StatusCode} body={pushResult.ResponseBody}");
 
         if (pushResult.Success)
         {
