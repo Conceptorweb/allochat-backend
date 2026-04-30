@@ -108,21 +108,33 @@ public static class GroupEndpoints
         .Distinct()
         .ToListAsync();
 
+
+
+
+
     var receiverDevices = await GetActiveDevicesForGroupUserIDsAsync(db, receiverUserIDs);
 
-    foreach (var device in receiverDevices)
-    {
-        var pushResult = await pushService.SendMessageNotificationAsync(
-            deviceToken: device.Token,
-            title: $"Group message from {message.SenderName}",
-            body: cleanContent.Length > 120 ? cleanContent.Substring(0, 117) + "..." : cleanContent
-        );
+Console.WriteLine($"GROUP PUSH DEBUG groupID={cleanGroupID}");
+Console.WriteLine($"GROUP PUSH DEBUG receiverUserIDs={receiverUserIDs.Count}");
+Console.WriteLine($"GROUP PUSH DEBUG receiverDevices={receiverDevices.Count}");
 
-        if (!pushResult.Success && (pushResult.StatusCode == 400 || pushResult.StatusCode == 410))
-        {
-            device.IsActive = false;
-        }
+foreach (var device in receiverDevices)
+{
+    Console.WriteLine($"GROUP PUSH DEBUG sending to deviceID={device.DeviceID} tokenLength={device.Token.Length}");
+
+    var pushResult = await pushService.SendMessageNotificationAsync(
+        deviceToken: device.Token,
+        title: $"Group message from {message.SenderName}",
+        body: cleanContent.Length > 120 ? cleanContent.Substring(0, 117) + "..." : cleanContent
+    );
+
+    Console.WriteLine($"GROUP PUSH DEBUG result success={pushResult.Success} status={pushResult.StatusCode} body={pushResult.ResponseBody}");
+
+    if (!pushResult.Success && (pushResult.StatusCode == 400 || pushResult.StatusCode == 410))
+    {
+        device.IsActive = false;
     }
+}
 
     if (receiverDevices.Any(d => !d.IsActive))
     {
