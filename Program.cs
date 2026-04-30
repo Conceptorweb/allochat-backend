@@ -550,9 +550,20 @@ app.MapGet("/api/messages/pending/{userID}", async (string userID, AlloChatDbCon
     }
 
     var pendingEntities = await db.Messages
-        .Where(m => m.ReceiverID == userID)
-        .OrderBy(m => m.SentAt)
-        .ToListAsync();
+    .Where(m => m.ReceiverID == userID)
+    .OrderBy(m => m.SentAt)
+    .ToListAsync();
+
+// 🔥 AJOUT : récupération des messages de groupe
+var userGroupIDs = await db.GroupMembers
+    .Where(gm => gm.UserID == userID)
+    .Select(gm => gm.GroupID)
+    .ToListAsync();
+
+var groupMessages = await db.GroupMessages
+    .Where(gm => userGroupIDs.Contains(gm.GroupID))
+    .OrderBy(gm => gm.SentAt)
+    .ToListAsync();
 
     var senderIDs = pendingEntities.Select(m => m.SenderID).Distinct().ToList();
 
@@ -561,21 +572,35 @@ app.MapGet("/api/messages/pending/{userID}", async (string userID, AlloChatDbCon
         .ToDictionaryAsync(u => u.UserID);
 
     var pending = pendingEntities
-        .Select(m =>
-        {
-            senders.TryGetValue(m.SenderID, out var sender);
+    .Select(m =>
+    {
+        senders.TryGetValue(m.SenderID, out var sender);
 
-            return new PendingMessageItem(
-                m.MessageID,
-                m.SenderID,
-                m.ReceiverID,
-                m.DeletedForEveryone ? "This message was deleted" : m.Content,
-                m.SentAt,
-                sender != null ? BuildDisplayName(sender) : "AlloChat",
-                sender?.AvatarImageData
-            );
-        })
-        .ToList();
+        return new PendingMessageItem(
+            m.MessageID,
+            m.SenderID,
+            m.ReceiverID,
+            m.DeletedForEveryone ? "This message was deleted" : m.Content,
+            m.SentAt,
+            sender != null ? BuildDisplayName(sender) : "AlloChat",
+            sender?.AvatarImageData
+        );
+    })
+    .ToList();
+
+// 🔥 AJOUT : transformer les messages de groupe en pending
+foreach (var gm in groupMessages)
+{
+    pending.Add(new PendingMessageItem(
+        gm.MessageID,
+        gm.SenderID,
+        gm.GroupID, // important
+        gm.Content,
+        gm.SentAt,
+        gm.SenderName,
+        null
+    ));
+}
 
     return Results.Ok(new PendingMessagesResponse(pending));
 })
@@ -589,13 +614,26 @@ app.MapPost("/api/messages/acknowledge", async (AcknowledgeMessageRequest reques
         return Results.BadRequest(new StandardServerResponse(false, "No message IDs provided."));
     }
 
-    var messagesToUpdate = await db.Messages
+    var directMessagesToDelete = await db.Messages
     .Where(m => request.MessageIDs.Contains(m.MessageID))
     .ToListAsync();
 
-if (messagesToUpdate.Any())
+var groupMessagesToDelete = await db.GroupMessages
+    .Where(m => request.MessageIDs.Contains(m.MessageID))
+    .ToListAsync();
+
+if (directMessagesToDelete.Any())
 {
-    db.Messages.RemoveRange(messagesToUpdate);
+    db.Messages.RemoveRange(directMessagesToDelete);
+}
+
+if (groupMessagesToDelete.Any())
+{
+    db.GroupMessages.RemoveRange(groupMessagesToDelete);
+}
+
+if (directMessagesToDelete.Any() || groupMessagesToDelete.Any())
+{
     await db.SaveChangesAsync();
 }
 
