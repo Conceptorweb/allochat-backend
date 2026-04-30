@@ -5,6 +5,7 @@ public class GroupEntity
     public string GroupID { get; set; } = "";
     public string Name { get; set; } = "";
     public string CreatorUserID { get; set; } = "";
+    public bool IsDeleted { get; set; } = false;
     public DateTime CreatedAt { get; set; }
 }
 
