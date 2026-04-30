@@ -4,6 +4,7 @@ public class GroupEntity
 {
     public string GroupID { get; set; } = "";
     public string Name { get; set; } = "";
+    public string CreatorUserID { get; set; } = "";
     public DateTime CreatedAt { get; set; }
 }
 

@@ -7,11 +7,17 @@ public static class GroupEndpoints
         app.MapPost("/api/groups/create", async (CreateGroupRequest request, AlloChatDbContext db) =>
         {
             var cleanName = request.Name?.Trim() ?? "";
+var cleanCreatorUserID = request.CreatorUserID?.Trim() ?? "";
 
-            if (string.IsNullOrWhiteSpace(cleanName))
-            {
-                return Results.BadRequest(new StandardServerResponse(false, "Group name is required."));
-            }
+if (string.IsNullOrWhiteSpace(cleanName))
+{
+    return Results.BadRequest(new StandardServerResponse(false, "Group name is required."));
+}
+
+if (string.IsNullOrWhiteSpace(cleanCreatorUserID))
+{
+    return Results.BadRequest(new StandardServerResponse(false, "CreatorUserID is required."));
+}
 
             var cleanMembers = (request.Members ?? new List<GroupMemberDTO>())
                 .Where(m => !string.IsNullOrWhiteSpace(m.UserID))
@@ -27,11 +33,12 @@ public static class GroupEndpoints
             var groupID = Guid.NewGuid().ToString();
 
             var group = new GroupEntity
-            {
-                GroupID = groupID,
-                Name = cleanName,
-                CreatedAt = DateTime.UtcNow
-            };
+{
+    GroupID = groupID,
+    Name = cleanName,
+    CreatorUserID = cleanCreatorUserID,
+    CreatedAt = DateTime.UtcNow
+};
 
             db.Groups.Add(group);
 
@@ -210,10 +217,11 @@ return Results.Ok(new StandardServerResponse(
         .Where(g => groupIDs.Contains(g.GroupID))
         .OrderByDescending(g => g.CreatedAt)
         .Select(g => new UserGroupResponse(
-            g.GroupID,
-            g.Name,
-            g.CreatedAt
-        ))
+    g.GroupID,
+    g.Name,
+    g.CreatorUserID,
+    g.CreatedAt
+))
         .ToListAsync();
 
     return Results.Ok(groups);
@@ -274,6 +282,57 @@ return Results.Ok(new StandardServerResponse(
 
         .WithName("LeaveGroup")
         .WithOpenApi();
+
+
+app.MapPost("/api/groups/delete", async (DeleteGroupRequest request, AlloChatDbContext db) =>
+{
+    var cleanGroupID = request.GroupID?.Trim().ToLowerInvariant() ?? "";
+    var cleanRequestingUserID = request.RequestingUserID?.Trim() ?? "";
+
+    if (string.IsNullOrWhiteSpace(cleanGroupID) ||
+        string.IsNullOrWhiteSpace(cleanRequestingUserID))
+    {
+        return Results.BadRequest(new StandardServerResponse(false, "GroupID and RequestingUserID are required."));
+    }
+
+    var group = await db.Groups.FirstOrDefaultAsync(g => g.GroupID == cleanGroupID);
+
+    if (group == null)
+    {
+        return Results.NotFound(new StandardServerResponse(false, "Group not found."));
+    }
+
+    if (group.CreatorUserID != cleanRequestingUserID)
+    {
+        return Results.BadRequest(new StandardServerResponse(false, "Only the group creator can delete this group."));
+    }
+
+    var deletedMessage = new GroupMessageEntity
+    {
+        MessageID = Guid.NewGuid().ToString(),
+        GroupID = cleanGroupID,
+        SenderID = cleanRequestingUserID,
+        SenderName = "System",
+        Content = "[GROUP_DELETED]\nGroup deleted by creator.",
+        SentAt = DateTime.UtcNow
+    };
+
+    db.GroupMessages.Add(deletedMessage);
+
+    var memberships = await db.GroupMembers
+        .Where(gm => gm.GroupID == cleanGroupID)
+        .ToListAsync();
+
+    db.GroupMembers.RemoveRange(memberships);
+
+    await db.SaveChangesAsync();
+
+    return Results.Ok(new StandardServerResponse(true, "Group deleted."));
+})
+.WithName("DeleteGroup")
+.WithOpenApi();
+
+
     }
 
     private static async Task<List<DeviceEntity>> GetActiveDevicesForGroupUserIDsAsync(
@@ -311,13 +370,13 @@ return Results.Ok(new StandardServerResponse(
     }
 }
 
-public record CreateGroupRequest(string Name, List<GroupMemberDTO> Members);
-
+public record CreateGroupRequest(string Name, string CreatorUserID, List<GroupMemberDTO> Members);
 
 public record CreateGroupResponse(string GroupID);
 public record GroupMemberDTO(string UserID, string DisplayName, string? AvatarImageData);
 public record SendGroupMessageRequest(string GroupID, string SenderID, string SenderName, string Content);
 public record GroupMessageResponse(string MessageID, string GroupID, string SenderID, string SenderName, string Content, DateTime SentAt);
-public record UserGroupResponse(string GroupID, string Name, DateTime CreatedAt);
+public record UserGroupResponse(string GroupID, string Name, string CreatorUserID, DateTime CreatedAt);
 public record LeaveGroupRequest(string GroupID, string UserID);
+public record DeleteGroupRequest(string GroupID, string RequestingUserID);
 
