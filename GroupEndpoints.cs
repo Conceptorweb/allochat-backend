@@ -128,6 +128,8 @@ foreach (var device in receiverDevices)
         body: cleanContent.Length > 120 ? cleanContent.Substring(0, 117) + "..." : cleanContent
     );
 
+Console.WriteLine($"GROUP APNS RESULT success={pushResult.Success} status={pushResult.StatusCode} body={pushResult.ResponseBody}");
+
     Console.WriteLine($"GROUP PUSH DEBUG result success={pushResult.Success} status={pushResult.StatusCode} body={pushResult.ResponseBody}");
 
     if (!pushResult.Success && (pushResult.StatusCode == 400 || pushResult.StatusCode == 410))
@@ -141,9 +143,11 @@ foreach (var device in receiverDevices)
         await db.SaveChangesAsync();
     }
 
-    return Results.Ok(new StandardServerResponse(
+    var activeDeviceCount = receiverDevices.Count;
+
+return Results.Ok(new StandardServerResponse(
     true,
-    $"Message sent. GROUP_PUSH_V2 receivers={receiverUserIDs.Count} devices={receiverDevices.Count}"
+    $"Message sent. GROUP_PUSH_V3 receivers={receiverUserIDs.Count} devices={activeDeviceCount}"
 ));
 
 })
