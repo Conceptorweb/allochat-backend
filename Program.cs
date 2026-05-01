@@ -178,6 +178,56 @@ app.MapPost("/api/users/lookup", async (ContactLookupRequest request, AlloChatDb
 .WithName("LookupContact")
 .WithOpenApi();
 
+
+
+app.MapPost("/api/users/update-profile", async (UpdateUserProfileRequest request, AlloChatDbContext db) =>
+{
+    var cleanUserID = request.UserID?.Trim() ?? "";
+    var cleanFirstName = request.FirstName?.Trim() ?? "";
+    var cleanLastName = request.LastName?.Trim() ?? "";
+    var cleanNickname = request.Nickname?.Trim() ?? "";
+    var cleanAvatarSystemName = request.AvatarSystemName?.Trim() ?? "";
+    var cleanAvailability = string.IsNullOrWhiteSpace(request.Availability)
+        ? "Available"
+        : request.Availability.Trim();
+
+    var cleanAvatarImageData = string.IsNullOrWhiteSpace(request.AvatarImageData)
+        ? null
+        : request.AvatarImageData.Trim();
+
+    if (string.IsNullOrWhiteSpace(cleanUserID) ||
+        string.IsNullOrWhiteSpace(cleanFirstName) ||
+        string.IsNullOrWhiteSpace(cleanLastName) ||
+        string.IsNullOrWhiteSpace(cleanNickname))
+    {
+        return Results.BadRequest(new StandardServerResponse(false, "UserID, first name, last name and nickname are required."));
+    }
+
+    var user = await db.Users.FirstOrDefaultAsync(u => u.UserID == cleanUserID);
+
+    if (user == null)
+    {
+        return Results.NotFound(new StandardServerResponse(false, "User not found."));
+    }
+
+    user.FirstName = cleanFirstName;
+    user.LastName = cleanLastName;
+    user.Nickname = cleanNickname;
+    user.AvatarSystemName = string.IsNullOrWhiteSpace(cleanAvatarSystemName)
+        ? "person.crop.circle.fill"
+        : cleanAvatarSystemName;
+    user.Availability = cleanAvailability;
+    user.AvatarImageData = cleanAvatarImageData;
+
+    await db.SaveChangesAsync();
+
+    return Results.Ok(new StandardServerResponse(true, "Profile updated."));
+})
+.WithName("UpdateUserProfile")
+.WithOpenApi();
+
+
+
 app.MapPost("/api/accounts/restore", async (RestoreAccountRequest request, AlloChatDbContext db) =>
 {
     var cleanUserID = request.UserID?.Trim() ?? "";
@@ -1124,6 +1174,8 @@ record AcknowledgeMessageRequest(List<string> MessageIDs);
 record ContactLookupRequest(string AlloCode);
 record ContactLookupResponse(string UserID, string AlloCode, string DisplayName, string Nickname, string AvatarSystemName, string Availability, string? AvatarImageData);
 record RegisterDeviceRequest(string DeviceID, string DeviceToken, List<string>? ProfileUserIDs, string? Platform);
+
+record UpdateUserProfileRequest(string UserID, string FirstName, string LastName, string Nickname, string AvatarSystemName, string Availability, string? AvatarImageData);
 
 static class Utils
 {
