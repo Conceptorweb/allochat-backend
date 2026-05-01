@@ -219,6 +219,9 @@ app.MapPost("/api/users/update-profile", async (UpdateUserProfileRequest request
     user.Availability = cleanAvailability;
     user.AvatarImageData = cleanAvatarImageData;
 
+Console.WriteLine($"UPDATE PROFILE IMAGE LENGTH: {cleanAvatarImageData?.Length ?? 0}");
+
+
     await db.SaveChangesAsync();
 
     return Results.Ok(new StandardServerResponse(true, "Profile updated."));
