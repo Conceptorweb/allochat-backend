@@ -27,17 +27,8 @@ builder.Services.AddHttpClient<ApnsPushService>();
 
 var app = builder.Build();
 
-
-
-
 app.UseSwagger();
 app.UseSwaggerUI();
-
-
-
-
-
-
 
 using (var scope = app.Services.CreateScope())
 {
@@ -47,8 +38,8 @@ using (var scope = app.Services.CreateScope())
     EnsureMessageDeletionColumns(db);
     EnsureDeviceArchitectureTables(db);
     EnsureGroupTables(db);
+    EnsureBackupTable(db);
 }
-
 
 _ = Task.Run(async () =>
 {
@@ -80,7 +71,6 @@ _ = Task.Run(async () =>
         await Task.Delay(TimeSpan.FromHours(6));
     }
 });
-
 
 var summaries = new[]
 {
@@ -378,7 +368,6 @@ app.MapPost("/api/messages/send", async (
 .WithName("SendMessage")
 .WithOpenApi();
 
-
 app.MapPost("/api/messages/delete", async (DeleteMessageRequest request, AlloChatDbContext db) =>
 {
     var cleanMessageID = request.MessageID?.Trim() ?? "";
@@ -499,19 +488,19 @@ app.MapPost("/api/emergency/send", async (
     var pushFailureCount = 0;
 
     Console.WriteLine($"EMERGENCY PUSH DEBUG receivers={receiverUserIDs.Count}");
-Console.WriteLine($"EMERGENCY PUSH DEBUG devices={receiverDevices.Count}");
+    Console.WriteLine($"EMERGENCY PUSH DEBUG devices={receiverDevices.Count}");
 
-foreach (var device in receiverDevices)
-{
-    Console.WriteLine($"EMERGENCY PUSH DEBUG sending to deviceID={device.DeviceID} tokenLength={device.Token.Length}");
+    foreach (var device in receiverDevices)
+    {
+        Console.WriteLine($"EMERGENCY PUSH DEBUG sending to deviceID={device.DeviceID} tokenLength={device.Token.Length}");
 
-    var pushResult = await pushService.SendMessageNotificationAsync(
-        deviceToken: device.Token,
-        title: pushTitle,
-        body: pushBody
-    );
+        var pushResult = await pushService.SendMessageNotificationAsync(
+            deviceToken: device.Token,
+            title: pushTitle,
+            body: pushBody
+        );
 
-    Console.WriteLine($"EMERGENCY APNS RESULT success={pushResult.Success} status={pushResult.StatusCode} body={pushResult.ResponseBody}");
+        Console.WriteLine($"EMERGENCY APNS RESULT success={pushResult.Success} status={pushResult.StatusCode} body={pushResult.ResponseBody}");
 
         if (pushResult.Success)
         {
@@ -550,9 +539,9 @@ app.MapGet("/api/messages/pending/{userID}", async (string userID, AlloChatDbCon
     }
 
     var pendingEntities = await db.Messages
-    .Where(m => m.ReceiverID == userID)
-    .OrderBy(m => m.SentAt)
-    .ToListAsync();
+        .Where(m => m.ReceiverID == userID)
+        .OrderBy(m => m.SentAt)
+        .ToListAsync();
 
     var senderIDs = pendingEntities.Select(m => m.SenderID).Distinct().ToList();
 
@@ -561,23 +550,21 @@ app.MapGet("/api/messages/pending/{userID}", async (string userID, AlloChatDbCon
         .ToDictionaryAsync(u => u.UserID);
 
     var pending = pendingEntities
-    .Select(m =>
-    {
-        senders.TryGetValue(m.SenderID, out var sender);
+        .Select(m =>
+        {
+            senders.TryGetValue(m.SenderID, out var sender);
 
-        return new PendingMessageItem(
-            m.MessageID,
-            m.SenderID,
-            m.ReceiverID,
-            m.DeletedForEveryone ? "This message was deleted" : m.Content,
-            m.SentAt,
-            sender != null ? BuildDisplayName(sender) : "AlloChat",
-            sender?.AvatarImageData
-        );
-    })
-    .ToList();
-
-
+            return new PendingMessageItem(
+                m.MessageID,
+                m.SenderID,
+                m.ReceiverID,
+                m.DeletedForEveryone ? "This message was deleted" : m.Content,
+                m.SentAt,
+                sender != null ? BuildDisplayName(sender) : "AlloChat",
+                sender?.AvatarImageData
+            );
+        })
+        .ToList();
 
     return Results.Ok(new PendingMessagesResponse(pending));
 })
@@ -592,26 +579,24 @@ app.MapPost("/api/messages/acknowledge", async (AcknowledgeMessageRequest reques
     }
 
     var messagesToUpdate = await db.Messages
-    .Where(m => request.MessageIDs.Contains(m.MessageID))
-    .ToListAsync();
+        .Where(m => request.MessageIDs.Contains(m.MessageID))
+        .ToListAsync();
 
-if (messagesToUpdate.Any())
-{
-    db.Messages.RemoveRange(messagesToUpdate);
-    await db.SaveChangesAsync();
-}
+    if (messagesToUpdate.Any())
+    {
+        db.Messages.RemoveRange(messagesToUpdate);
+        await db.SaveChangesAsync();
+    }
 
-return Results.Ok(new StandardServerResponse(true, "ACK processed."));
+    return Results.Ok(new StandardServerResponse(true, "ACK processed."));
 })
 .WithName("AcknowledgeMessages")
 .WithOpenApi();
 
 var port = Environment.GetEnvironmentVariable("PORT") ?? "10000";
 
-
-
 app.MapGroupEndpoints();
-
+app.MapBackupEndpoints();
 
 app.Run($"http://0.0.0.0:{port}");
 
@@ -745,10 +730,10 @@ static string PushBodyForMessage(string content, string senderName)
         return $"{senderName} shared a location.";
     }
 
-if (cleanContent.StartsWith("[IMAGE_V1]"))
-{
-    return $"{senderName} sent you a photo.";
-}
+    if (cleanContent.StartsWith("[IMAGE_V1]"))
+    {
+        return $"{senderName} sent you a photo.";
+    }
 
     if (cleanContent.Length > 120)
     {
@@ -821,7 +806,6 @@ static void EnsureUserSessionColumns(AlloChatDbContext db)
     """);
 }
 
-
 static void EnsureMessageDeletionColumns(AlloChatDbContext db)
 {
     db.Database.ExecuteSqlRaw("""
@@ -829,8 +813,6 @@ static void EnsureMessageDeletionColumns(AlloChatDbContext db)
         ADD COLUMN IF NOT EXISTS "DeletedForEveryone" boolean NOT NULL DEFAULT false;
     """);
 }
-
-
 
 static void EnsureGroupTables(AlloChatDbContext db)
 {
@@ -899,7 +881,17 @@ ON "GroupMessages" ("SenderID");
 """);
 }
 
-
+static void EnsureBackupTable(AlloChatDbContext db)
+{
+    db.Database.ExecuteSqlRaw("""
+CREATE TABLE IF NOT EXISTS "Backups" (
+    "AlloCode" text NOT NULL,
+    "EncryptedPayloadJson" text NOT NULL,
+    "UpdatedAt" timestamp with time zone NOT NULL,
+    CONSTRAINT "PK_Backups" PRIMARY KEY ("AlloCode")
+);
+""");
+}
 
 // -------- APNs --------
 
@@ -936,14 +928,12 @@ class ApnsPushService
                 ? "https://api.sandbox.push.apple.com"
                 : "https://api.push.apple.com";
 
-
-Console.WriteLine($"APNS CONFIG env={apnsEnv}");
-Console.WriteLine($"APNS CONFIG host={host}");
-Console.WriteLine($"APNS CONFIG keyID={keyID}");
-Console.WriteLine($"APNS CONFIG teamID={teamID}");
-Console.WriteLine($"APNS CONFIG bundleID={bundleID}");
-Console.WriteLine($"APNS CONFIG tokenLength={deviceToken.Length}");
-
+            Console.WriteLine($"APNS CONFIG env={apnsEnv}");
+            Console.WriteLine($"APNS CONFIG host={host}");
+            Console.WriteLine($"APNS CONFIG keyID={keyID}");
+            Console.WriteLine($"APNS CONFIG teamID={teamID}");
+            Console.WriteLine($"APNS CONFIG bundleID={bundleID}");
+            Console.WriteLine($"APNS CONFIG tokenLength={deviceToken.Length}");
 
             var url = $"{host}/3/device/{deviceToken}";
 
@@ -1031,6 +1021,8 @@ class AlloChatDbContext : DbContext
     public DbSet<GroupMemberEntity> GroupMembers => Set<GroupMemberEntity>();
     public DbSet<GroupMessageEntity> GroupMessages => Set<GroupMessageEntity>();
 
+    public DbSet<BackupEntity> Backups => Set<BackupEntity>();
+
     protected override void OnModelCreating(ModelBuilder modelBuilder)
     {
         modelBuilder.Entity<RegisteredUserEntity>().HasKey(u => u.UserID);
@@ -1049,18 +1041,18 @@ class AlloChatDbContext : DbContext
         modelBuilder.Entity<DeviceProfileEntity>().HasIndex(dp => dp.UserID);
         modelBuilder.Entity<DeviceProfileEntity>().HasIndex(dp => new { dp.DeviceID, dp.UserID }).IsUnique();
 
+        modelBuilder.Entity<GroupEntity>().HasKey(g => g.GroupID);
+        modelBuilder.Entity<GroupEntity>().HasIndex(g => g.Name);
 
-modelBuilder.Entity<GroupEntity>().HasKey(g => g.GroupID);
-modelBuilder.Entity<GroupEntity>().HasIndex(g => g.Name);
+        modelBuilder.Entity<GroupMemberEntity>().HasKey(gm => gm.GroupMemberID);
+        modelBuilder.Entity<GroupMemberEntity>().HasIndex(gm => gm.GroupID);
+        modelBuilder.Entity<GroupMemberEntity>().HasIndex(gm => gm.UserID);
 
-modelBuilder.Entity<GroupMemberEntity>().HasKey(gm => gm.GroupMemberID);
-modelBuilder.Entity<GroupMemberEntity>().HasIndex(gm => gm.GroupID);
-modelBuilder.Entity<GroupMemberEntity>().HasIndex(gm => gm.UserID);
+        modelBuilder.Entity<GroupMessageEntity>().HasKey(gm => gm.MessageID);
+        modelBuilder.Entity<GroupMessageEntity>().HasIndex(gm => gm.GroupID);
+        modelBuilder.Entity<GroupMessageEntity>().HasIndex(gm => gm.SenderID);
 
-modelBuilder.Entity<GroupMessageEntity>().HasKey(gm => gm.MessageID);
-modelBuilder.Entity<GroupMessageEntity>().HasIndex(gm => gm.GroupID);
-modelBuilder.Entity<GroupMessageEntity>().HasIndex(gm => gm.SenderID);
-
+        modelBuilder.Entity<BackupEntity>().HasKey(b => b.AlloCode);
     }
 }
 
