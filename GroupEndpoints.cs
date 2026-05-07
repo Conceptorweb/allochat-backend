@@ -417,6 +417,20 @@ public static class GroupEndpoints
         })
         .WithName("DeleteGroup")
         .WithOpenApi();
+
+
+app.MapGet("/api/admin/stats/groups", async (AlloChatDbContext db) =>
+{
+    var groupsCount = await db.Groups.CountAsync();
+
+    return Results.Ok(new
+    {
+        groupsCount
+    });
+})
+.WithName("GetGroupsStats")
+.WithOpenApi();
+
     }
 
     private static async Task<bool> IsGroupMemberAsync(AlloChatDbContext db, string groupID, string userID)
