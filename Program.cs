@@ -120,6 +120,19 @@ app.MapGet("/api/health", () => Results.Ok(new StandardServerResponse(true, "All
 .WithName("HealthCheck")
 .WithOpenApi();
 
+
+app.MapGet("/api/admin/stats/users", async (AlloChatDbContext db) =>
+{
+    var usersCount = await db.Users.CountAsync();
+
+    return Results.Ok(new
+    {
+        usersCount
+    });
+})
+.WithName("GetUsersStats")
+.WithOpenApi();
+
 app.MapPost("/api/users/register", async (RegisterUserRequest request, AlloChatDbContext db) =>
 {
     var cleanFirstName = request.FirstName?.Trim() ?? "";
