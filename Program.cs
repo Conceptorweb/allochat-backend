@@ -133,6 +133,20 @@ app.MapGet("/api/admin/stats/users", async (AlloChatDbContext db) =>
 .WithName("GetUsersStats")
 .WithOpenApi();
 
+
+app.MapGet("/api/admin/stats/backups", async (AlloChatDbContext db) =>
+{
+    var backupsCount = await db.Backups.CountAsync();
+
+    return Results.Ok(new
+    {
+        backupsCount
+    });
+})
+.WithName("GetBackupsStats")
+.WithOpenApi();
+
+
 app.MapPost("/api/users/register", async (RegisterUserRequest request, AlloChatDbContext db) =>
 {
     var cleanFirstName = request.FirstName?.Trim() ?? "";
