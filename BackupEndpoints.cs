@@ -4,18 +4,20 @@ using Microsoft.EntityFrameworkCore;
 public static class BackupEndpoints
 {
     private static readonly TimeSpan BackupValidityDuration = TimeSpan.FromHours(24);
+    private const int MaxEncryptedPayloadJsonLength = 2_000_000;
 
     public static void MapBackupEndpoints(this WebApplication app)
     {
         app.MapPost("/api/backup/export", async (BackupExportRequest request, AlloChatDbContext db) =>
         {
             var cleanAlloCode = request.AlloCode?.Trim().ToUpperInvariant() ?? "";
+            var cleanUserID = request.UserID?.Trim() ?? "";
 
-            if (string.IsNullOrWhiteSpace(cleanAlloCode))
+            if (string.IsNullOrWhiteSpace(cleanAlloCode) || string.IsNullOrWhiteSpace(cleanUserID))
             {
                 return Results.BadRequest(new StandardServerResponse(
                     false,
-                    "AlloCode is required to create a backup."
+                    "AlloCode and UserID are required to create a backup."
                 ));
             }
 
@@ -27,9 +29,7 @@ public static class BackupEndpoints
                 ));
             }
 
-            if (request.EncryptedPayload.Version <= 0 ||
-                string.IsNullOrWhiteSpace(request.EncryptedPayload.Salt) ||
-                string.IsNullOrWhiteSpace(request.EncryptedPayload.EncryptedData))
+            if (!IsValidEncryptedPayload(request.EncryptedPayload))
             {
                 return Results.BadRequest(new StandardServerResponse(
                     false,
@@ -37,38 +37,53 @@ public static class BackupEndpoints
                 ));
             }
 
-            var userExists = await db.Users.AnyAsync(u => u.AlloCode.ToUpper() == cleanAlloCode);
+            var userExists = await db.Users.AnyAsync(u =>
+                u.UserID == cleanUserID &&
+                u.AlloCode.ToUpper() == cleanAlloCode
+            );
 
             if (!userExists)
             {
-                return Results.NotFound(new StandardServerResponse(
+                Console.WriteLine($"SECURITY_BLOCK backup_export identity_mismatch userID={ShortID(cleanUserID)} alloCode={ShortID(cleanAlloCode)}");
+                return Results.BadRequest(new StandardServerResponse(
                     false,
-                    "No AlloChat profile was found for this AlloCode."
+                    "Backup identity could not be verified."
+                ));
+            }
+
+            var payloadJson = JsonSerializer.Serialize(request.EncryptedPayload);
+
+            if (payloadJson.Length > MaxEncryptedPayloadJsonLength)
+            {
+                return Results.BadRequest(new StandardServerResponse(
+                    false,
+                    "Backup data is too large. Please reduce saved data and try again."
                 ));
             }
 
             var now = DateTime.UtcNow;
-            var payloadJson = JsonSerializer.Serialize(request.EncryptedPayload);
-
-            var existingBackup = await db.Backups
-                .FirstOrDefaultAsync(b => b.AlloCode == cleanAlloCode);
+            var existingBackup = await db.Backups.FirstOrDefaultAsync(b => b.AlloCode == cleanAlloCode);
 
             if (existingBackup == null)
             {
                 db.Backups.Add(new BackupEntity
                 {
                     AlloCode = cleanAlloCode,
+                    UserID = cleanUserID,
                     EncryptedPayloadJson = payloadJson,
                     UpdatedAt = now
                 });
             }
             else
             {
+                existingBackup.UserID = cleanUserID;
                 existingBackup.EncryptedPayloadJson = payloadJson;
                 existingBackup.UpdatedAt = now;
             }
 
             await db.SaveChangesAsync();
+
+            Console.WriteLine($"BACKUP_EXPORT userID={ShortID(cleanUserID)} alloCode={ShortID(cleanAlloCode)} size={payloadJson.Length}");
 
             return Results.Ok(new StandardServerResponse(
                 true,
@@ -81,24 +96,42 @@ public static class BackupEndpoints
         app.MapPost("/api/backup/import", async (BackupImportRequest request, AlloChatDbContext db) =>
         {
             var cleanAlloCode = request.AlloCode?.Trim().ToUpperInvariant() ?? "";
+            var cleanUserID = request.UserID?.Trim() ?? "";
 
-            if (string.IsNullOrWhiteSpace(cleanAlloCode))
+            if (string.IsNullOrWhiteSpace(cleanAlloCode) || string.IsNullOrWhiteSpace(cleanUserID))
             {
                 return Results.BadRequest(new BackupImportResponse(
                     false,
-                    "AlloCode is required to restore a backup.",
+                    "AlloCode and UserID are required to restore a backup.",
                     null
                 ));
             }
 
-            var backup = await db.Backups
-                .FirstOrDefaultAsync(b => b.AlloCode == cleanAlloCode);
+            var identityValid = await db.Users.AnyAsync(u =>
+                u.UserID == cleanUserID &&
+                u.AlloCode.ToUpper() == cleanAlloCode
+            );
+
+            if (!identityValid)
+            {
+                Console.WriteLine($"SECURITY_BLOCK backup_import identity_mismatch userID={ShortID(cleanUserID)} alloCode={ShortID(cleanAlloCode)}");
+                return Results.BadRequest(new BackupImportResponse(
+                    false,
+                    "Backup identity could not be verified.",
+                    null
+                ));
+            }
+
+            var backup = await db.Backups.FirstOrDefaultAsync(b =>
+                b.AlloCode == cleanAlloCode &&
+                b.UserID == cleanUserID
+            );
 
             if (backup == null)
             {
                 return Results.NotFound(new BackupImportResponse(
                     false,
-                    "No backup was found for this AlloCode. Please create a new backup first.",
+                    "No backup was found for this profile. Please create a new backup first.",
                     null
                 ));
             }
@@ -132,10 +165,7 @@ public static class BackupEndpoints
                 ));
             }
 
-            if (encryptedPayload == null ||
-                encryptedPayload.Version <= 0 ||
-                string.IsNullOrWhiteSpace(encryptedPayload.Salt) ||
-                string.IsNullOrWhiteSpace(encryptedPayload.EncryptedData))
+            if (encryptedPayload == null || !IsValidEncryptedPayload(encryptedPayload))
             {
                 return Results.BadRequest(new BackupImportResponse(
                     false,
@@ -143,6 +173,8 @@ public static class BackupEndpoints
                     null
                 ));
             }
+
+            Console.WriteLine($"BACKUP_IMPORT userID={ShortID(cleanUserID)} alloCode={ShortID(cleanAlloCode)} ageMinutes={(int)backupAge.TotalMinutes}");
 
             return Results.Ok(new BackupImportResponse(
                 true,
@@ -152,5 +184,20 @@ public static class BackupEndpoints
         })
         .WithName("ImportBackup")
         .WithOpenApi();
+    }
+
+    private static bool IsValidEncryptedPayload(EncryptedBackupPayload payload)
+    {
+        return payload.Version > 0 &&
+               !string.IsNullOrWhiteSpace(payload.Salt) &&
+               payload.Salt.Length <= 512 &&
+               !string.IsNullOrWhiteSpace(payload.EncryptedData) &&
+               payload.EncryptedData.Length <= MaxEncryptedPayloadJsonLength;
+    }
+
+    private static string ShortID(string value)
+    {
+        if (string.IsNullOrWhiteSpace(value)) { return "empty"; }
+        return value.Length <= 8 ? value : value.Substring(0, 8);
     }
 }

@@ -3,11 +3,15 @@ using System.Security.Cryptography;
 using System.Text;
 using System.Text.Json;
 using Microsoft.EntityFrameworkCore;
+using Microsoft.AspNetCore.HttpOverrides;
 
 var builder = WebApplication.CreateBuilder(args);
 
 builder.Services.AddEndpointsApiExplorer();
 builder.Services.AddSwaggerGen();
+
+builder.Logging.ClearProviders();
+builder.Logging.AddConsole();
 
 var databaseUrl = Environment.GetEnvironmentVariable("DATABASE_URL");
 
@@ -20,15 +24,55 @@ var connectionString = ConvertDatabaseUrlToConnectionString(databaseUrl);
 
 builder.Services.AddDbContext<AlloChatDbContext>(options =>
 {
-    options.UseNpgsql(connectionString);
+    options.UseNpgsql(connectionString, npgsqlOptions =>
+    {
+        npgsqlOptions.EnableRetryOnFailure(
+            maxRetryCount: 5,
+            maxRetryDelay: TimeSpan.FromSeconds(5),
+            errorCodesToAdd: null
+        );
+    });
 });
 
-builder.Services.AddHttpClient<ApnsPushService>();
+builder.Services.AddHttpClient<ApnsPushService>(client =>
+{
+    client.Timeout = TimeSpan.FromSeconds(20);
+});
 
 var app = builder.Build();
 
-app.UseSwagger();
-app.UseSwaggerUI();
+app.UseForwardedHeaders(new ForwardedHeadersOptions
+{
+    ForwardedHeaders = ForwardedHeaders.XForwardedFor | ForwardedHeaders.XForwardedProto
+});
+
+app.Use(async (context, next) =>
+{
+    try
+    {
+        await next();
+    }
+    catch (Exception ex)
+    {
+        Console.WriteLine($"SERVER_ERROR path={context.Request.Path} error={TrimForLog(ex.Message)}");
+
+        if (!context.Response.HasStarted)
+        {
+            context.Response.StatusCode = StatusCodes.Status500InternalServerError;
+            context.Response.ContentType = "application/json";
+            await context.Response.WriteAsJsonAsync(new StandardServerResponse(
+                false,
+                "A temporary server error occurred. Please try again."
+            ));
+        }
+    }
+});
+
+if (app.Environment.IsDevelopment())
+{
+    app.UseSwagger();
+    app.UseSwaggerUI();
+}
 
 using (var scope = app.Services.CreateScope())
 {
@@ -72,24 +116,8 @@ _ = Task.Run(async () =>
     }
 });
 
-var summaries = new[]
-{
-    "Freezing", "Bracing", "Chilly", "Cool", "Mild", "Warm", "Balmy", "Hot", "Sweltering", "Scorching"
-};
-
-app.MapGet("/weatherforecast", () =>
-{
-    var forecast = Enumerable.Range(1, 5).Select(index =>
-        new WeatherForecast(
-            DateOnly.FromDateTime(DateTime.Now.AddDays(index)),
-            Random.Shared.Next(-20, 55),
-            summaries[Random.Shared.Next(summaries.Length)]
-        ))
-        .ToArray();
-
-    return forecast;
-})
-.WithName("GetWeatherForecast")
+app.MapGet("/api/health", () => Results.Ok(new StandardServerResponse(true, "AlloChat backend is running.")))
+.WithName("HealthCheck")
 .WithOpenApi();
 
 app.MapPost("/api/users/register", async (RegisterUserRequest request, AlloChatDbContext db) =>
@@ -218,8 +246,6 @@ app.MapPost("/api/users/update-profile", async (UpdateUserProfileRequest request
         : cleanAvatarSystemName;
     user.Availability = cleanAvailability;
     user.AvatarImageData = cleanAvatarImageData;
-
-Console.WriteLine($"UPDATE PROFILE IMAGE LENGTH: {cleanAvatarImageData?.Length ?? 0}");
 
 
     await db.SaveChangesAsync();
@@ -361,28 +387,35 @@ app.MapPost("/api/messages/send", async (
     ApnsPushService pushService
 ) =>
 {
-    if (string.IsNullOrWhiteSpace(request.SenderID) ||
-        string.IsNullOrWhiteSpace(request.ReceiverID) ||
-        string.IsNullOrWhiteSpace(request.Content))
+    var cleanSenderID = request.SenderID?.Trim() ?? "";
+    var cleanReceiverID = request.ReceiverID?.Trim() ?? "";
+    var cleanContent = CleanText(request.Content, 2000);
+
+    if (string.IsNullOrWhiteSpace(cleanSenderID) ||
+        string.IsNullOrWhiteSpace(cleanReceiverID) ||
+        string.IsNullOrWhiteSpace(cleanContent))
     {
         return Results.BadRequest(new StandardServerResponse(false, "Invalid message data."));
     }
 
-    var sender = await db.Users.FirstOrDefaultAsync(u => u.UserID == request.SenderID);
-    var receiverExists = await db.Users.AnyAsync(u => u.UserID == request.ReceiverID);
+    if (cleanSenderID == cleanReceiverID)
+    {
+        return Results.BadRequest(new StandardServerResponse(false, "Sender and receiver cannot be identical."));
+    }
+
+    var sender = await db.Users.FirstOrDefaultAsync(u => u.UserID == cleanSenderID);
+    var receiverExists = await db.Users.AnyAsync(u => u.UserID == cleanReceiverID);
 
     if (sender == null || !receiverExists)
     {
         return Results.NotFound(new StandardServerResponse(false, "Sender or receiver not found."));
     }
 
-    var cleanContent = request.Content.Trim();
-
     var message = new ChatMessageEntity
     {
         MessageID = Guid.NewGuid().ToString(),
-        SenderID = request.SenderID,
-        ReceiverID = request.ReceiverID,
+        SenderID = cleanSenderID,
+        ReceiverID = cleanReceiverID,
         Content = cleanContent,
         SentAt = DateTime.UtcNow,
         Delivered = false
@@ -395,7 +428,7 @@ app.MapPost("/api/messages/send", async (
         ? BuildDisplayName(sender)
         : request.SenderDisplayName.Trim();
 
-    var receiverDevices = await GetActiveDevicesForUserIDsAsync(db, new List<string> { request.ReceiverID });
+    var receiverDevices = await GetActiveDevicesForUserIDsAsync(db, new List<string> { cleanReceiverID });
 
     foreach (var device in receiverDevices)
     {
@@ -540,20 +573,13 @@ app.MapPost("/api/emergency/send", async (
     var pushSuccessCount = 0;
     var pushFailureCount = 0;
 
-    Console.WriteLine($"EMERGENCY PUSH DEBUG receivers={receiverUserIDs.Count}");
-    Console.WriteLine($"EMERGENCY PUSH DEBUG devices={receiverDevices.Count}");
-
     foreach (var device in receiverDevices)
     {
-        Console.WriteLine($"EMERGENCY PUSH DEBUG sending to deviceID={device.DeviceID} tokenLength={device.Token.Length}");
-
         var pushResult = await pushService.SendMessageNotificationAsync(
             deviceToken: device.Token,
             title: pushTitle,
             body: pushBody
         );
-
-        Console.WriteLine($"EMERGENCY APNS RESULT success={pushResult.Success} status={pushResult.StatusCode} body={pushResult.ResponseBody}");
 
         if (pushResult.Success)
         {
@@ -584,15 +610,29 @@ app.MapPost("/api/emergency/send", async (
 .WithName("SendEmergencyAlert")
 .WithOpenApi();
 
-app.MapGet("/api/messages/pending/{userID}", async (string userID, AlloChatDbContext db) =>
+app.MapGet("/api/messages/pending/{userID}", async (string userID, string? deviceID, AlloChatDbContext db) =>
 {
-    if (string.IsNullOrWhiteSpace(userID))
+    var cleanUserID = userID?.Trim() ?? "";
+    var cleanDeviceID = deviceID?.Trim() ?? "";
+
+    if (string.IsNullOrWhiteSpace(cleanUserID) || string.IsNullOrWhiteSpace(cleanDeviceID))
     {
-        return Results.BadRequest(new StandardServerResponse(false, "UserID is required."));
+        return Results.BadRequest(new StandardServerResponse(false, "UserID and DeviceID are required."));
+    }
+
+    var deviceOwnsProfile = await db.DeviceProfiles.AnyAsync(link =>
+        link.UserID == cleanUserID &&
+        link.DeviceID == cleanDeviceID
+    );
+
+    if (!deviceOwnsProfile)
+    {
+        Console.WriteLine($"SECURITY_BLOCK pending_messages device_profile_mismatch userID={ShortID(cleanUserID)} deviceID={ShortID(cleanDeviceID)}");
+        return Results.BadRequest(new StandardServerResponse(false, "This device is not authorized for this profile."));
     }
 
     var pendingEntities = await db.Messages
-        .Where(m => m.ReceiverID == userID)
+        .Where(m => m.ReceiverID == cleanUserID)
         .OrderBy(m => m.SentAt)
         .ToListAsync();
 
@@ -626,19 +666,33 @@ app.MapGet("/api/messages/pending/{userID}", async (string userID, AlloChatDbCon
 
 app.MapPost("/api/messages/acknowledge", async (AcknowledgeMessageRequest request, AlloChatDbContext db) =>
 {
-    if (request.MessageIDs == null || !request.MessageIDs.Any())
+    var cleanRequestingUserID = request.RequestingUserID?.Trim() ?? "";
+    var cleanMessageIDs = (request.MessageIDs ?? new List<string>())
+        .Where(id => !string.IsNullOrWhiteSpace(id))
+        .Select(id => id.Trim())
+        .Distinct()
+        .Take(100)
+        .ToList();
+
+    if (string.IsNullOrWhiteSpace(cleanRequestingUserID) || !cleanMessageIDs.Any())
     {
-        return Results.BadRequest(new StandardServerResponse(false, "No message IDs provided."));
+        return Results.BadRequest(new StandardServerResponse(false, "RequestingUserID and message IDs are required."));
     }
 
     var messagesToUpdate = await db.Messages
-        .Where(m => request.MessageIDs.Contains(m.MessageID))
+        .Where(m => cleanMessageIDs.Contains(m.MessageID) && m.ReceiverID == cleanRequestingUserID)
         .ToListAsync();
 
     if (messagesToUpdate.Any())
     {
         db.Messages.RemoveRange(messagesToUpdate);
         await db.SaveChangesAsync();
+    }
+
+    var blockedCount = cleanMessageIDs.Count - messagesToUpdate.Count;
+    if (blockedCount > 0)
+    {
+        Console.WriteLine($"SECURITY_BLOCK ack ownership userID={ShortID(cleanRequestingUserID)} blocked={blockedCount}");
     }
 
     return Results.Ok(new StandardServerResponse(true, "ACK processed."));
@@ -715,7 +769,13 @@ static string ConvertDatabaseUrlToConnectionString(string databaseUrl)
         $"Username={username}",
         $"Password={password}",
         "Ssl Mode=Require",
-        "Trust Server Certificate=true"
+        "Trust Server Certificate=true",
+        "Timeout=15",
+        "Command Timeout=30",
+        "Keepalive=30",
+        "Pooling=true",
+        "Minimum Pool Size=0",
+        "Maximum Pool Size=20"
     };
 
     if (uri.Port > 0)
@@ -794,6 +854,25 @@ static string PushBodyForMessage(string content, string senderName)
     }
 
     return cleanContent;
+}
+
+
+static string CleanText(string? value, int maxLength)
+{
+    var clean = value?.Trim() ?? "";
+    return clean.Length <= maxLength ? clean : clean.Substring(0, maxLength);
+}
+
+static string ShortID(string value)
+{
+    if (string.IsNullOrWhiteSpace(value)) { return "empty"; }
+    return value.Length <= 8 ? value : value.Substring(0, 8);
+}
+
+static string TrimForLog(string value)
+{
+    var clean = value?.Replace("\n", " ").Replace("\r", " ").Trim() ?? "";
+    return clean.Length <= 180 ? clean : clean.Substring(0, 180) + "...";
 }
 
 static void EnsureDeviceArchitectureTables(AlloChatDbContext db)
@@ -939,10 +1018,26 @@ static void EnsureBackupTable(AlloChatDbContext db)
     db.Database.ExecuteSqlRaw("""
 CREATE TABLE IF NOT EXISTS "Backups" (
     "AlloCode" text NOT NULL,
+    "UserID" text NOT NULL DEFAULT '',
     "EncryptedPayloadJson" text NOT NULL,
     "UpdatedAt" timestamp with time zone NOT NULL,
     CONSTRAINT "PK_Backups" PRIMARY KEY ("AlloCode")
 );
+""");
+
+    db.Database.ExecuteSqlRaw("""
+ALTER TABLE "Backups"
+ADD COLUMN IF NOT EXISTS "UserID" text NOT NULL DEFAULT '';
+""");
+
+    db.Database.ExecuteSqlRaw("""
+CREATE INDEX IF NOT EXISTS "IX_Backups_UserID"
+ON "Backups" ("UserID");
+""");
+
+    db.Database.ExecuteSqlRaw("""
+CREATE INDEX IF NOT EXISTS "IX_Backups_UpdatedAt"
+ON "Backups" ("UpdatedAt");
 """);
 }
 
@@ -981,13 +1076,6 @@ class ApnsPushService
                 ? "https://api.sandbox.push.apple.com"
                 : "https://api.push.apple.com";
 
-            Console.WriteLine($"APNS CONFIG env={apnsEnv}");
-            Console.WriteLine($"APNS CONFIG host={host}");
-            Console.WriteLine($"APNS CONFIG keyID={keyID}");
-            Console.WriteLine($"APNS CONFIG teamID={teamID}");
-            Console.WriteLine($"APNS CONFIG bundleID={bundleID}");
-            Console.WriteLine($"APNS CONFIG tokenLength={deviceToken.Length}");
-
             var url = $"{host}/3/device/{deviceToken}";
 
             var payload = new
@@ -1019,7 +1107,8 @@ class ApnsPushService
         }
         catch (Exception ex)
         {
-            return new ApnsSendResult(false, 0, ex.Message);
+            Console.WriteLine($"APNS_EXCEPTION error={ex.Message.Replace("\n", " ").Replace("\r", " ").Trim()}");
+            return new ApnsSendResult(false, 0, "APNs temporary error.");
         }
     }
 
@@ -1106,6 +1195,7 @@ class AlloChatDbContext : DbContext
         modelBuilder.Entity<GroupMessageEntity>().HasIndex(gm => gm.SenderID);
 
         modelBuilder.Entity<BackupEntity>().HasKey(b => b.AlloCode);
+        modelBuilder.Entity<BackupEntity>().HasIndex(b => b.UserID);
     }
 }
 
@@ -1173,7 +1263,7 @@ record EmergencyAlertRequest(string SenderID, List<string> ReceiverIDs, string S
 record EmergencyAlertResponse(bool Success, string Message, int SentCount, int FailedCount);
 record PendingMessageItem(string MessageID, string SenderID, string ReceiverID, string Content, DateTime SentAt, string? SenderDisplayName, string? SenderAvatarImageData);
 record PendingMessagesResponse(List<PendingMessageItem> Messages);
-record AcknowledgeMessageRequest(List<string> MessageIDs);
+record AcknowledgeMessageRequest(List<string> MessageIDs, string? RequestingUserID);
 record ContactLookupRequest(string AlloCode);
 record ContactLookupResponse(string UserID, string AlloCode, string DisplayName, string Nickname, string AvatarSystemName, string Availability, string? AvatarImageData);
 record RegisterDeviceRequest(string DeviceID, string DeviceToken, List<string>? ProfileUserIDs, string? Platform);

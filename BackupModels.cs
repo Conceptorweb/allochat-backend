@@ -3,17 +3,20 @@ using System;
 public class BackupEntity
 {
     public string AlloCode { get; set; } = "";
+    public string UserID { get; set; } = "";
     public string EncryptedPayloadJson { get; set; } = "";
     public DateTime UpdatedAt { get; set; }
 }
 
 public record BackupExportRequest(
     string AlloCode,
+    string UserID,
     EncryptedBackupPayload EncryptedPayload
 );
 
 public record BackupImportRequest(
-    string AlloCode
+    string AlloCode,
+    string UserID
 );
 
 public record BackupImportResponse(
