@@ -253,6 +253,38 @@ app.MapGet("/api/admin/users/detail", async (
 .WithOpenApi();
 
 
+app.MapGet("/api/admin/backups/download", async (
+    string userID,
+    AlloChatDbContext db) =>
+{
+    var cleanUserID =
+        userID.Trim();
+
+    var backup = await db.Backups
+        .FirstOrDefaultAsync(b =>
+            b.UserID == cleanUserID
+        );
+
+    if (backup == null)
+    {
+        return Results.NotFound(new
+        {
+            error = "BACKUP_NOT_FOUND"
+        });
+    }
+
+    return Results.Ok(new
+    {
+        backup.AlloCode,
+        backup.UserID,
+        backup.EncryptedPayloadJson,
+        backup.UpdatedAt
+    });
+})
+.WithName("AdminDownloadBackup")
+.WithOpenApi();
+
+
 app.MapPost("/api/users/register", async (RegisterUserRequest request, AlloChatDbContext db) =>
 {
     var cleanFirstName = request.FirstName?.Trim() ?? "";
