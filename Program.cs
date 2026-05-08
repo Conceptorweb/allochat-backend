@@ -213,12 +213,12 @@ app.MapGet("/api/admin/users/detail", async (
     }
 
     var messagesCount =
-        await db.Messages
-            .CountAsync(m =>
-                m.SenderUserID == cleanUserID
-                ||
-                m.ReceiverUserID == cleanUserID
-            );
+    await db.Messages
+        .CountAsync(m =>
+            m.SenderID == cleanUserID
+            ||
+            m.ReceiverID == cleanUserID
+        );
 
     var groupsCount =
         await db.GroupMembers
