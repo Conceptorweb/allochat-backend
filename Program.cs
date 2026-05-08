@@ -192,6 +192,67 @@ app.MapGet("/api/admin/users/search", async (string query, AlloChatDbContext db)
 .WithOpenApi();
 
 
+app.MapGet("/api/admin/users/detail", async (
+    string userID,
+    AlloChatDbContext db) =>
+{
+    var cleanUserID =
+        userID.Trim();
+
+    var user = await db.Users
+        .FirstOrDefaultAsync(
+            u => u.UserID == cleanUserID
+        );
+
+    if (user == null)
+    {
+        return Results.NotFound(new
+        {
+            error = "USER_NOT_FOUND"
+        });
+    }
+
+    var messagesCount =
+        await db.Messages
+            .CountAsync(m =>
+                m.SenderUserID == cleanUserID
+                ||
+                m.ReceiverUserID == cleanUserID
+            );
+
+    var groupsCount =
+        await db.GroupMembers
+            .CountAsync(g =>
+                g.UserID == cleanUserID
+            );
+
+    var backupExists =
+        await db.Backups
+            .AnyAsync(b =>
+                b.UserID == cleanUserID
+            );
+
+    return Results.Ok(new
+    {
+        user.UserID,
+        user.AlloCode,
+        user.FirstName,
+        user.LastName,
+        user.Nickname,
+        user.Availability,
+        user.CreatedAt,
+        user.ActiveDeviceID,
+        user.SessionVersion,
+
+        messagesCount,
+        groupsCount,
+        backupExists
+    });
+})
+.WithName("AdminUserDetail")
+.WithOpenApi();
+
+
 app.MapPost("/api/users/register", async (RegisterUserRequest request, AlloChatDbContext db) =>
 {
     var cleanFirstName = request.FirstName?.Trim() ?? "";
