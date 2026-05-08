@@ -147,6 +147,51 @@ app.MapGet("/api/admin/stats/backups", async (AlloChatDbContext db) =>
 .WithOpenApi();
 
 
+app.MapGet("/api/admin/users/search", async (string query, AlloChatDbContext db) =>
+{
+    var cleanQuery = query.Trim().ToLower();
+
+    if (string.IsNullOrWhiteSpace(cleanQuery))
+    {
+        return Results.Ok(new
+        {
+            users = new List<object>()
+        });
+    }
+
+    var users = await db.Users
+        .Where(u =>
+            u.UserID.ToLower().Contains(cleanQuery) ||
+            u.AlloCode.ToLower().Contains(cleanQuery) ||
+            u.FirstName.ToLower().Contains(cleanQuery) ||
+            u.LastName.ToLower().Contains(cleanQuery) ||
+            u.Nickname.ToLower().Contains(cleanQuery)
+        )
+        .OrderByDescending(u => u.CreatedAt)
+        .Take(20)
+        .Select(u => new
+        {
+            u.UserID,
+            u.AlloCode,
+            u.FirstName,
+            u.LastName,
+            u.Nickname,
+            u.Availability,
+            u.CreatedAt,
+            u.ActiveDeviceID,
+            u.SessionVersion
+        })
+        .ToListAsync();
+
+    return Results.Ok(new
+    {
+        users
+    });
+})
+.WithName("AdminSearchUsers")
+.WithOpenApi();
+
+
 app.MapPost("/api/users/register", async (RegisterUserRequest request, AlloChatDbContext db) =>
 {
     var cleanFirstName = request.FirstName?.Trim() ?? "";
