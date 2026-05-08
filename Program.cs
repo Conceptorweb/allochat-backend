@@ -163,6 +163,30 @@ app.MapGet("/api/admin/stats/backups", async (AlloChatDbContext db) =>
 .WithOpenApi();
 
 
+app.MapGet("/api/admin/stats/backups-storage", async (
+    AlloChatDbContext db) =>
+{
+    var backups = await db.Backups
+        .ToListAsync();
+
+    long totalBytes = backups.Sum(b =>
+        b.EncryptedPayloadJson.Length
+    );
+
+    double totalMegabytes =
+        totalBytes / 1024d / 1024d;
+
+    return Results.Ok(new
+    {
+        bytes = totalBytes,
+        megabytes =
+            Math.Round(totalMegabytes, 2)
+    });
+})
+.WithName("AdminBackupsStorage")
+.WithOpenApi();
+
+
 app.MapGet("/api/admin/backups/list", async (
     AlloChatDbContext db) =>
 {
