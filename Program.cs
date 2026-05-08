@@ -106,6 +106,22 @@ _ = Task.Run(async () =>
                 await db.SaveChangesAsync();
                 Console.WriteLine($"Cleaned {oldMessages.Count} old messages");
             }
+
+
+var backupThreshold = DateTime.UtcNow.AddHours(-24);
+
+var oldBackups = await db.Backups
+    .Where(b => b.UpdatedAt < backupThreshold)
+    .ToListAsync();
+
+if (oldBackups.Any())
+{
+    db.Backups.RemoveRange(oldBackups);
+    await db.SaveChangesAsync();
+
+    Console.WriteLine($"Cleaned {oldBackups.Count} expired backups");
+}
+
         }
         catch (Exception ex)
         {
