@@ -147,6 +147,28 @@ app.MapGet("/api/admin/stats/backups", async (AlloChatDbContext db) =>
 .WithOpenApi();
 
 
+app.MapGet("/api/admin/backups/list", async (
+    AlloChatDbContext db) =>
+{
+    var backups = await db.Backups
+        .OrderByDescending(b => b.UpdatedAt)
+        .Select(b => new
+        {
+            b.AlloCode,
+            b.UserID,
+            b.UpdatedAt
+        })
+        .ToListAsync();
+
+    return Results.Ok(new
+    {
+        backups
+    });
+})
+.WithName("AdminListBackups")
+.WithOpenApi();
+
+
 app.MapGet("/api/admin/users/search", async (string query, AlloChatDbContext db) =>
 {
     var cleanQuery = query.Trim().ToLower();
