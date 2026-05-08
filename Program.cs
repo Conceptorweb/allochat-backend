@@ -94,7 +94,7 @@ _ = Task.Run(async () =>
             using var scope = app.Services.CreateScope();
             var db = scope.ServiceProvider.GetRequiredService<AlloChatDbContext>();
 
-            var threshold = DateTime.UtcNow.AddDays(-7);
+            var threshold = DateTime.UtcNow.AddHours(-24);
 
             var oldMessages = await db.Messages
                 .Where(m => m.SentAt < threshold)
@@ -106,6 +106,19 @@ _ = Task.Run(async () =>
                 await db.SaveChangesAsync();
                 Console.WriteLine($"Cleaned {oldMessages.Count} old messages");
             }
+
+
+            var oldGroupMessages = await db.GroupMessages
+    .Where(m => m.SentAt < threshold)
+    .ToListAsync();
+
+if (oldGroupMessages.Any())
+{
+    db.GroupMessages.RemoveRange(oldGroupMessages);
+    await db.SaveChangesAsync();
+
+    Console.WriteLine($"Cleaned {oldGroupMessages.Count} old group messages");
+}
 
 
 var backupThreshold = DateTime.UtcNow.AddHours(-24);
@@ -147,6 +160,43 @@ app.MapGet("/api/admin/stats/users", async (AlloChatDbContext db) =>
     });
 })
 .WithName("GetUsersStats")
+.WithOpenApi();
+
+
+app.MapGet("/api/admin/stats/database-storage",
+    async (AlloChatDbContext db) =>
+{
+    await using var connection =
+        db.Database.GetDbConnection();
+
+    await connection.OpenAsync();
+
+    await using var command =
+        connection.CreateCommand();
+
+    command.CommandText =
+        "SELECT pg_database_size(current_database())";
+
+    var result =
+        await command.ExecuteScalarAsync();
+
+    long bytes =
+        Convert.ToInt64(result);
+
+    double megabytes =
+        Math.Round(bytes / 1024d / 1024d, 2);
+
+    double gigabytes =
+        Math.Round(megabytes / 1024d, 2);
+
+    return Results.Ok(new
+    {
+        bytes,
+        megabytes,
+        gigabytes
+    });
+})
+.WithName("AdminDatabaseStorage")
 .WithOpenApi();
 
 
